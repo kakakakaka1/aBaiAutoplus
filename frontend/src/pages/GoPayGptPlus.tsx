@@ -110,11 +110,24 @@ export default function GoPayGptPlus() {
   const [smsbowerApiKey, setSmsbowerApiKey] = useState(
     "",
   );
+  // smsapi（固定手机号 + 查最新短信 API）：用户自己的实体卡/长期号
+  const [smsapiPhone, setSmsapiPhone] = useState("");
+  const [smsapiUrl, setSmsapiUrl] = useState("");
   // Hero-SMS API key 不存账号 extra（避免泄漏给前端 overview），付款步骤
   // 必须在每次任务提交时透传。默认填一个常用 key，留空则后端回退环境变量。
   const [herosmsApiKey, setHerosmsApiKey] = useState(
     "",
   );
+  // 调试抓包开关：开启后抓到 midtrans_url 不关浏览器，停在付款页让人工手动
+  // 走完 GoPay 网页付款，全程录 HAR + dump 每页 HTML，不跑协议付款。
+  const [capturePayment, setCapturePayment] = useState(false);
+  // 付款成功后自动换绑：买临时外国号绑上去，释放当前 GoPay 印尼号
+  const [autoRebind, setAutoRebind] = useState(false);
+  // 换绑专用接码渠道（独立于注册渠道）：herosms / smsbower
+  const [rebindProvider, setRebindProvider] = useState("herosms");
+  const [rebindSmsKey, setRebindSmsKey] = useState("");
+  const [rebindCountry, setRebindCountry] = useState("");
+  const [rebindService, setRebindService] = useState("");
 
   const BROWSER_MODE_OPTIONS = [
     { value: "camoufox_headed", label: "Camoufox 前台" },
@@ -206,7 +219,15 @@ export default function GoPayGptPlus() {
         sms_provider: smsProvider,
         smspool_api_key: smspoolApiKey.trim(),
         smsbower_api_key: smsbowerApiKey.trim(),
+        smsapi_url: smsapiUrl.trim(),
+        smsapi_phone: smsapiPhone.trim(),
         max_price: maxPrice.trim(),
+        capture_payment: capturePayment,
+        auto_rebind: autoRebind,
+        rebind_provider: rebindProvider,
+        rebind_sms_key: rebindSmsKey.trim(),
+        rebind_country: rebindCountry.trim(),
+        rebind_service: rebindService.trim(),
       };
       // 未选 ChatGPT 账号 → 从注册开始
       if (selectedChatgpt.size === 0) {
@@ -339,6 +360,89 @@ export default function GoPayGptPlus() {
               </p>
             </div>
           )}
+          <div className="md:col-span-4">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={capturePayment}
+                onChange={(e) => setCapturePayment(e.target.checked)}
+                className="h-4 w-4"
+              />
+              <span className="text-[var(--text)]">
+                调试抓包模式（抓到 midtrans 后不关浏览器，人工手动付款，录 HAR + 每页 HTML）
+              </span>
+            </label>
+            {capturePayment && (
+              <p className="mt-1 text-[11px] text-[var(--text-muted)] leading-tight">
+                开启后程序不跑协议付款：抓到 midtrans_url 会停在付款页，请手动走完 GoPay 网页付款全流程。
+                产物存到工作目录 <code>_gopay_capture/&lt;时间戳&gt;/</code>（HAR + 各页面 HTML）。
+                完成后在该目录新建一个名为 <code>STOP</code> 的空文件结束抓包。
+                <strong>要拿 HAR 请用 Camoufox 模式</strong>（BitBrowser CDP 录不了 HAR，只有 HTML）。
+              </p>
+            )}
+          </div>
+          <div className="md:col-span-4">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={autoRebind}
+                onChange={(e) => setAutoRebind(e.target.checked)}
+                className="h-4 w-4"
+              />
+              <span className="text-[var(--text)]">
+                付款成功后自动换绑释放号（买临时外国号绑上去，把当前印尼号还回接码平台）
+              </span>
+            </label>
+            {autoRebind && (
+              <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div>
+                  <label className="block mb-1 text-[var(--text-muted)]">换绑接码渠道</label>
+                  <select
+                    value={rebindProvider}
+                    onChange={(e) => setRebindProvider(e.target.value)}
+                    className="control-surface control-surface-compact w-full"
+                  >
+                    <option value="herosms">Hero-SMS</option>
+                    <option value="smsbower">SMSBower</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block mb-1 text-[var(--text-muted)]">换绑接码 API Key</label>
+                  <input
+                    type="password"
+                    value={rebindSmsKey}
+                    onChange={(e) => setRebindSmsKey(e.target.value)}
+                    placeholder="独立 key，留空回退环境变量"
+                    className="control-surface control-surface-compact w-full"
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1 text-[var(--text-muted)]">换绑国家（留空=泰国52）</label>
+                  <input
+                    type="text"
+                    value={rebindCountry}
+                    onChange={(e) => setRebindCountry(e.target.value)}
+                    placeholder="52"
+                    className="control-surface control-surface-compact w-full text-center"
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1 text-[var(--text-muted)]">换绑服务（留空=ni）</label>
+                  <input
+                    type="text"
+                    value={rebindService}
+                    onChange={(e) => setRebindService(e.target.value)}
+                    placeholder="ni"
+                    className="control-surface control-surface-compact w-full text-center"
+                  />
+                </div>
+                <div className="md:col-span-4 text-[11px] text-[var(--text-muted)] leading-tight">
+                  换绑渠道独立于注册渠道：注册用 smsapi（固定号）时换绑仍会从这里买一次性外国号。
+                  注册成功后会自动登录账号 → 换绑到临时号 → 释放原印尼号（#1/#2 同此开关）。
+                </div>
+              </div>
+            )}
+          </div>
           {selectedChatgpt.size === 0 && (
             <div>
               <label className="block mb-1">注册 ChatGPT 数量（未选账号时）</label>
@@ -420,6 +524,7 @@ export default function GoPayGptPlus() {
               <option value="herosms">Hero-SMS</option>
               <option value="smspool">SMSPool</option>
               <option value="smsbower">SMSBower</option>
+              <option value="smsapi">SmsApi（自有固定号）</option>
             </select>
           </div>
           <div>
@@ -466,6 +571,38 @@ export default function GoPayGptPlus() {
                 className="control-surface control-surface-compact w-full"
               />
             </div>
+          )}
+          {smsProvider === "smsapi" && (
+            <>
+              <div>
+                <label className="block mb-1 text-[var(--text-muted)]">
+                  固定手机号（含国码，如 +6281930860580）
+                </label>
+                <input
+                  type="text"
+                  value={smsapiPhone}
+                  onChange={(e) => setSmsapiPhone(e.target.value)}
+                  placeholder="+6281930860580"
+                  className="control-surface control-surface-compact w-full font-mono"
+                />
+              </div>
+              <div>
+                <label className="block mb-1 text-[var(--text-muted)]">
+                  查最新短信 API URL（含 token）
+                </label>
+                <input
+                  type="password"
+                  value={smsapiUrl}
+                  onChange={(e) => setSmsapiUrl(e.target.value)}
+                  placeholder="https://api.sms8.net/api/record?token=xxxx"
+                  className="control-surface control-surface-compact w-full"
+                />
+                <div className="mt-1 text-xs text-[var(--text-muted)]">
+                  自有实体卡 / 长期号 + 该号的「查最新短信」接口。注册/PIN/付款
+                  共用同一个号，靠短信时间区分新旧 OTP。
+                </div>
+              </div>
+            </>
           )}
           <div className="md:col-span-2">
             <label className="block mb-1 text-[var(--text-muted)]">

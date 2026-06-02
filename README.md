@@ -233,14 +233,7 @@ npm run dev
 
 ## 桌面版下载
 
-> 🚀 **零配置一键启动**：不想折腾 Python 和 Node.js？直接下载桌面客户端，双击即可使用。
-
-| 平台                              | 下载                                                                                |
-| --------------------------------- | ----------------------------------------------------------------------------------- |
-| 🍎 macOS（Intel / Apple Silicon） | [前往 Releases 下载 `.dmg`](https://github.com/asz798838958/aBaiAutoplus/releases/latest) |
-| 🪟 Windows                        | [前往 Releases 下载 `.exe`](https://github.com/asz798838958/aBaiAutoplus/releases/latest) |
-
-桌面客户端基于 Electron 打包，内置完整的 Python 后端 + React 前端，开箱即用。每次发布新版本（`v*` tag）会自动构建并发布到 Releases。
+暂不提供安装包使用，没办法开箱即用
 
 如需源码运行或自行打包，参考上方 [快速开始](#快速开始) 与 `electron/` 目录。
 

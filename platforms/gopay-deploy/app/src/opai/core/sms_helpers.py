@@ -44,22 +44,42 @@ def sms_get_number(api_key: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def sms_wait_code(api_key: str, aid: str, timeout: int = SMS_TIMEOUT) -> str | None:
+def sms_wait_code(api_key: str, aid: str, timeout: int = SMS_TIMEOUT, ignore_code: str | None = None) -> str | None:
+    """轮询 herosms getStatus 等验证码。
+
+    ``ignore_code``：上一阶段已用过的旧码（如注册 OTP）。herosms 在
+    ``setStatus=3`` 后会回 ``STATUS_WAIT_RETRY:<旧码>``，新码到达才变
+    ``STATUS_OK:<新码>``。传入旧码后，即便拿到 ``STATUS_OK`` 但等于旧码也
+    继续等，避免把旧码当新阶段 OTP。
+    """
+    ignore = str(ignore_code or "").strip()
     deadline = time.time() + timeout
+    polls = 0
     while time.time() < deadline:
         try:
             resp = sms_api(api_key, "getStatus", {"id": aid})
-        except Exception:
+        except Exception as e:
+            log.warning("getStatus(%s) 异常: %s", aid, e)
             time.sleep(5)
             continue
         if resp.startswith("STATUS_OK:"):
             code = resp.split(":", 1)[1]
             m = re.search(r"\b(\d{4,6})\b", code)
-            return m.group(1) if m else code
+            code = m.group(1) if m else code
+            if ignore and code == ignore:
+                polls += 1
+                log.info("等待 SMS 新码 #%d（aid=%s）: 仍是旧码 %s，继续等", polls, aid, code)
+                time.sleep(5)
+                continue
+            log.info("getStatus(%s) -> 收到验证码 %s", aid, code)
+            return code
         if resp == "STATUS_CANCEL":
-            log.warning("SMS activation cancelled")
+            log.warning("SMS activation %s cancelled", aid)
             return None
+        polls += 1
+        log.info("等待 SMS 验证码 #%d（aid=%s）: %s", polls, aid, resp or "(空)")
         time.sleep(5)
+    log.warning("SMS 等码超时（aid=%s, %ds）", aid, timeout)
     return None
 
 

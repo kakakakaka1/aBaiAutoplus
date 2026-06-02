@@ -228,8 +228,15 @@ def register_gopay_account(
     sms_provider: str = "herosms",
     smspool_api_key: str = "",
     smsbower_api_key: str = "",
+    smsapi_url: str = "",
+    smsapi_phone: str = "",
     herosms_max_price_usd: str = "",
     smspool_max_price: str = "",
+    auto_rebind: bool = False,
+    rebind_provider: str = "herosms",
+    rebind_sms_key: str = "",
+    rebind_country: str = "",
+    rebind_service: str = "",
     log: Callable[[str], None] = print,
 ) -> AccountModel | None:
     """自动注册一个新 GoPay 号并入库，返回 AccountModel。
@@ -283,8 +290,16 @@ def register_gopay_account(
             "sms_provider": provider,
             "smspool_api_key": str(smspool_api_key or ""),
             "smsbower_api_key": str(smsbower_api_key or ""),
+            "smsapi_url": str(smsapi_url or ""),
+            "smsapi_phone": str(smsapi_phone or ""),
             "herosms_max_price_usd": str(herosms_max_price_usd or ""),
             "smspool_max_price": str(smspool_max_price or ""),
+            # auto_rebind：号已注册时登录+换绑释放再重注册（换绑渠道独立）
+            "auto_rebind": bool(auto_rebind),
+            "rebind_provider": str(rebind_provider or "herosms"),
+            "rebind_sms_key": str(rebind_sms_key or ""),
+            "rebind_country": str(rebind_country or ""),
+            "rebind_service": str(rebind_service or ""),
         },
     )
     try:
@@ -342,6 +357,165 @@ def register_gopay_account(
 
     with Session(engine) as session:
         return session.get(AccountModel, model_id)
+
+
+# ===========================================================================
+# 换绑（改绑新号 + 释放旧号）编排
+# ===========================================================================
+
+def _build_rebind_otp_callback(
+    *,
+    rebind_provider: str = "herosms",
+    rebind_sms_key: str = "",
+    country: str = "",
+    service: str = "",
+    log: Callable[[str], None] = print,
+):
+    """买一个换绑用的临时外国号，返回 ``(new_phone, wait_otp, finish, cancel)``。
+
+    **换绑渠道独立于注册渠道**：注册可能用 smsapi（固定号，没法买一次性号），
+    换绑必须走能买一次性外国号的渠道（herosms / smsbower，SMS-Activate 风格）。
+
+    new_phone: 新号（+xx...）；wait_otp(phone, timeout)->code；finish() 用完归还；
+    cancel() 失败取消。买号失败返回 ``(None, ...)``。
+    """
+    from platforms.gopay._opai_loader import ensure_opai_on_path
+
+    ensure_opai_on_path()
+
+    provider = str(rebind_provider or "herosms").strip().lower()
+    key = str(rebind_sms_key or "").strip()
+
+    if provider == "smsbower":
+        from platforms.gopay.sms_channel import make_smsbower_channel
+        key = key or os.environ.get("OPAI_SMSBOWER_API_KEY", "").strip()
+        if not key:
+            log("换绑失败：缺少 SMSBower API key（买换绑临时号用）")
+            return None, None, None, None
+        channel = make_smsbower_channel(api_key=key, country=country, service=service)
+    else:
+        # 默认 Hero-SMS
+        from platforms.gopay.sms_channel import make_herosms_rebind_channel
+        key = key or os.environ.get("OPAI_HEROSMS_API_KEY", "").strip()
+        if not key:
+            log("换绑失败：缺少 Hero-SMS API key（买换绑临时号用）")
+            return None, None, None, None
+        channel = make_herosms_rebind_channel(api_key=key, country=country, service=service)
+
+    new_phone, aid = channel.get_number()
+    if not new_phone or not aid:
+        log(f"换绑失败：{provider} 没买到换绑临时号")
+        return None, None, None, None
+    log(f"换绑临时号已购（{provider}）：{new_phone}（aid={aid}）")
+
+    def _wait_otp(_phone_arg: str = "", timeout: int = 180) -> Optional[str]:
+        try:
+            channel.request_another(aid)
+        except Exception:
+            pass
+        time.sleep(2)
+        return channel.wait_code(aid, timeout=timeout)
+
+    def _finish() -> None:
+        try:
+            channel.done(aid)
+        except Exception:
+            pass
+
+    def _cancel() -> None:
+        try:
+            channel.cancel(aid)
+        except Exception:
+            pass
+
+    return new_phone, _wait_otp, _finish, _cancel
+
+
+def rebind_release_phone(
+    client,
+    *,
+    pin: str,
+    rebind_provider: str = "herosms",
+    rebind_sms_key: str = "",
+    rebind_country: str = "",
+    rebind_service: str = "",
+    log: Callable[[str], None] = print,
+) -> dict:
+    """把已登录账号换绑到一个新临时号，从而释放它当前占用的（印尼）号。
+
+    返回 ``{"success": bool, "detail": str, "new_phone": str}``。
+    """
+    new_phone, wait_otp, finish, cancel = _build_rebind_otp_callback(
+        rebind_provider=rebind_provider,
+        rebind_sms_key=rebind_sms_key,
+        country=rebind_country,
+        service=rebind_service,
+        log=log,
+    )
+    if not new_phone:
+        return {"success": False, "detail": "换绑临时号获取失败", "new_phone": ""}
+    try:
+        res = client.rebind_phone(
+            new_phone=new_phone, pin=pin, wait_otp=wait_otp,
+            otp_timeout=180, log=log,
+        )
+        if res.get("success"):
+            finish()
+        else:
+            cancel()
+        return res
+    except Exception as exc:
+        cancel()
+        return {"success": False, "detail": f"换绑异常: {exc}", "new_phone": new_phone}
+
+
+def login_and_rebind_release(
+    *,
+    phone: str,
+    pin: str,
+    proxy: str = "",
+    login_sms_key: str = "",
+    use_pin: bool = True,
+    rebind_provider: str = "herosms",
+    rebind_sms_key: str = "",
+    rebind_country: str = "",
+    rebind_service: str = "",
+    log: Callable[[str], None] = print,
+) -> dict:
+    """#1：登录一个**已注册**的号 → 换绑到新临时号 → 释放原号 ``phone``。
+
+    释放后原号 ``phone`` 可以拿去重新注册新账号。返回换绑结果（含 released_phone）。
+    ``login_sms_key``：登录走 OTP 时接码用（PIN 强登则用不到）。
+    """
+    from platforms.gopay._opai_loader import ensure_opai_on_path
+
+    ensure_opai_on_path()
+    from opai.core.gopay_protocol_worker import _login_one
+
+    eff_proxy = _normalize_proxy_url(proxy)
+    if not eff_proxy:
+        try:
+            from core.proxy_pool import proxy_pool
+
+            picked = proxy_pool.get_next(region="ID") or ""
+            if picked:
+                eff_proxy = _normalize_proxy_url(picked)
+                log(f"代理池分配：{_mask_proxy(eff_proxy)}（换绑登录用）")
+        except Exception:
+            pass
+
+    log(f"换绑流程：登录已注册号 {phone}…")
+    logged = _login_one(phone, pin, eff_proxy, use_pin=use_pin, api_key=login_sms_key)
+    if not logged or not logged.get("client"):
+        return {"success": False, "detail": f"登录 {phone} 失败，无法换绑", "released_phone": ""}
+
+    res = rebind_release_phone(
+        logged["client"], pin=pin,
+        rebind_provider=rebind_provider, rebind_sms_key=rebind_sms_key,
+        rebind_country=rebind_country, rebind_service=rebind_service, log=log,
+    )
+    res["released_phone"] = phone if res.get("success") else ""
+    return res
 
 
 def wait_for_balance(
@@ -534,6 +708,8 @@ def step_grab_midtrans_url(
     bit_api_token: str = "",
     proxy: Optional[str] = None,
     timeout_seconds: int = 300,
+    capture_dir: str = "",
+    after_grab: Optional[Callable[[str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     log: Callable[[str], None] = print,
 ) -> str:
@@ -544,6 +720,10 @@ def step_grab_midtrans_url(
       camoufox_headed / camoufox_headless / bitbrowser_headed /
       bitbrowser_hidden / bitbrowser_headless。
     bitbrowser_* 必须提供 ``bit_profile_id``。
+
+    ``capture_dir`` 非空时开启调试抓包：抓到 midtrans_url 不关浏览器，停在
+    付款页让人工手动付款，录 HAR + dump 每页 HTML。``after_grab`` 在抓到 url
+    后、进入人工付款等待前调用（用于浏览器开着时准备 GoPay 账号）。
     """
     from platforms.chatgpt import payment as chatgpt_payment
     from platforms._browser_backend import parse_checkout_mode, DEFAULT_BIT_API_URL
@@ -563,6 +743,8 @@ def step_grab_midtrans_url(
         backend_config=backend_config,
         proxy=proxy,
         timeout_seconds=timeout_seconds,
+        capture_dir=capture_dir,
+        after_grab=after_grab,
         cancel_check=cancel_check,
         log=log,
     )
@@ -575,6 +757,7 @@ def step_pay_with_gopay(
     herosms_api_key_override: str = "",
     smspool_api_key_override: str = "",
     smsbower_api_key_override: str = "",
+    smsapi_url_override: str = "",
     sms_provider_override: str = "",
     log: Callable[[str], None] = print,
 ) -> dict:
@@ -640,6 +823,8 @@ def step_pay_with_gopay(
         herosms_api_key=herosms_api_key_override,
         smspool_api_key=smspool_api_key_override,
         smsbower_api_key=smsbower_api_key_override,
+        smsapi_url=smsapi_url_override,
+        smsapi_phone=str(extra.get("phone") or phone_local or ""),
         log=log,
     )
 
@@ -678,6 +863,8 @@ def _build_payment_sms_callbacks(
     herosms_api_key: str = "",
     smspool_api_key: str = "",
     smsbower_api_key: str = "",
+    smsapi_url: str = "",
+    smsapi_phone: str = "",
     log: Callable[[str], None] = print,
 ) -> tuple[Callable[..., Optional[str]], Callable[[], None]]:
     """按接码渠道返回 ``(wait_otp, sms_done)`` 两个回调。
@@ -690,6 +877,39 @@ def _build_payment_sms_callbacks(
       ignore 注册旧码避免把它当付款 OTP；想稳就用 herosms / smsbower。
     """
     provider = (provider or "herosms").strip().lower()
+
+    if provider == "smsapi":
+        from platforms.gopay.sms_channel import SmsApiChannel
+        import os as _os
+
+        url = (
+            str(smsapi_url or "").strip()
+            or _os.environ.get("OPAI_SMSAPI_URL", "").strip()
+        )
+        phone = (
+            str(smsapi_phone or "").strip()
+            or _os.environ.get("OPAI_SMSAPI_PHONE", "").strip()
+        )
+        channel = SmsApiChannel(url=url, phone=phone)
+        # 付款前快照基线短信时间：付款 OTP 必须比这条更新才认（避免把注册/PIN
+        # 阶段的旧码当付款 OTP）。
+        try:
+            channel.prime()
+        except Exception:
+            pass
+
+        def _wait_otp(_phone_arg: str = "", timeout: int = 120) -> Optional[str]:
+            # 重置基线 -> 等比基线更新的短信（GoPay 这次付款新发的 SMS OTP）。
+            try:
+                channel.request_another(phone)
+            except Exception:
+                pass
+            return channel.wait_code(phone, timeout=timeout)
+
+        def _sms_done() -> None:
+            return None
+
+        return _wait_otp, _sms_done
 
     if provider == "smspool":
         from platforms.gopay.sms_channel import SmsPoolChannel, SMSPOOL_DEFAULT_API_KEY
@@ -806,8 +1026,17 @@ def execute_gopay_pay_chatgpt(
     sms_provider: str = "herosms",
     smspool_api_key: str = "",
     smsbower_api_key: str = "",
+    smsapi_url: str = "",
+    smsapi_phone: str = "",
     max_price: str = "",
     gopay_source: str = "auto",
+    auto_rebind: bool = False,
+    rebind_provider: str = "herosms",
+    rebind_sms_key: str = "",
+    rebind_country: str = "",
+    rebind_service: str = "",
+    capture_payment: bool = False,
+    capture_dir: str = "",
     log: Callable[[str], None] = print,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -856,33 +1085,19 @@ def execute_gopay_pay_chatgpt(
         raise RuntimeError("chatgpt_account_id 为 0 时必须提供 midtrans_url_override")
 
     # ① 拿 cashier_url（除非已 override）
-    if not midtrans_url_override:
-        ttl_guard.check()
-        if not cashier_url_override:
-            out["cashier_url"] = step_generate_cashier_url(
-                chatgpt,
-                country=country,
-                currency=currency,
-                proxy=proxy,
-                log=log,
-            )
-        cashier_url = out["cashier_url"]
+    # 抓包模式：算一个本次抓包目录（前端开关 capture_payment 打开时）。
+    effective_capture_dir = ""
+    if capture_payment:
+        base = str(capture_dir or "").strip()
+        if not base:
+            base = os.path.join(os.getcwd(), "_gopay_capture")
+        effective_capture_dir = os.path.join(base, time.strftime("%Y%m%d_%H%M%S"))
+        log(f"[capture] 抓包模式已开启，HAR/HTML 将保存到: {effective_capture_dir}")
 
-        # ② 浏览器抓 midtrans_url（自动选 GoPay + 填表 + 点订阅）
-        ttl_guard.check()
-        out["midtrans_url"] = step_grab_midtrans_url(
-            cashier_url,
-            checkout_mode=checkout_mode,
-            bit_profile_id=bit_profile_id,
-            proxy=proxy,
-            timeout_seconds=grab_timeout,
-            cancel_check=cancel_check,
-            log=log,
-        )
-    midtrans_url = out["midtrans_url"]
-
-    # ③ 选 GoPay 号 + 协议付款
-    ttl_guard.check()
+    # ③ 的逻辑（选/注册 GoPay 号 + 查余额）抽成闭包：
+    #   - 普通模式：抓到 midtrans 后直接调，再跑协议付款；
+    #   - 抓包模式：作为 after_grab 回调，在浏览器开着时跑（注册/设PIN/查余额），
+    #     把账号信息打印出来给人工手动付款，最后不跑协议付款。
     source = str(gopay_source or "auto").strip().lower()
 
     def _do_register():
@@ -899,75 +1114,192 @@ def execute_gopay_pay_chatgpt(
             sms_provider=sms_provider,
             smspool_api_key=smspool_api_key,
             smsbower_api_key=smsbower_api_key,
+            smsapi_url=smsapi_url,
+            smsapi_phone=smsapi_phone,
             herosms_max_price_usd=max_price,
             smspool_max_price=max_price,
+            auto_rebind=auto_rebind,
+            rebind_provider=rebind_provider,
+            rebind_sms_key=rebind_sms_key,
+            rebind_country=rebind_country,
+            rebind_service=rebind_service,
             log=log,
         )
 
-    if source == "register":
-        # 强制现注册新号：优先级高于 gopay_account_id（避免前端残留的指定号
-        # 覆盖"强制注册"开关）。忽略号池和任何指定号。
-        log("GoPay 号来源=强制注册：现注册一个新号（忽略号池/指定号）")
-        gopay = _do_register()
-        if not gopay:
-            raise RuntimeError("强制注册 GoPay 号失败，详见上方日志")
-    elif gopay_account_id:
-        with Session(engine) as session:
-            gopay = session.get(AccountModel, int(gopay_account_id))
-            if not gopay or gopay.platform != "gopay":
-                raise RuntimeError(
-                    f"GoPay 账号 #{gopay_account_id} 不存在或不是 gopay 平台"
-                )
-    else:
-        gopay = None
+    def _prepare_gopay_account(_midtrans_url: str = "", _page=None):
+        """选/注册 GoPay 号 + 查余额（含红包补余额），返回可用的 AccountModel。
 
-        if source == "pool":
-            # 只用号池，池空直接失败，不注册。
-            gopay = pick_available_gopay_account(min_balance_rp=1) or _latest_gopay_account()
-            if not gopay:
-                raise RuntimeError("GoPay 号来源=号池：池里没有可用号（且不允许注册）")
-            log("GoPay 号来源=号池：复用已有号")
+        注册/设 PIN 走纯协议（不依赖浏览器）。抓包模式下由 after_grab 触发
+        （带 midtrans_url + page 参数）；普通模式下抓完 midtrans 直接调。
+        准备好账号后，如果传了 page（抓包模式），直接用浏览器脚本驱动付款。
+        """
+        ttl_guard.check()
+        if source == "register":
+            log("GoPay 号来源=强制注册：现注册一个新号（忽略号池/指定号）")
+            acc = _do_register()
+            if not acc:
+                raise RuntimeError("强制注册 GoPay 号失败，详见上方日志")
+        elif gopay_account_id:
+            with Session(engine) as session:
+                acc = session.get(AccountModel, int(gopay_account_id))
+                if not acc or acc.platform != "gopay":
+                    raise RuntimeError(
+                        f"GoPay 账号 #{gopay_account_id} 不存在或不是 gopay 平台"
+                    )
         else:
-            # auto：先查池，池空再按 auto_register_gopay 决定是否注册。
-            gopay = pick_available_gopay_account(min_balance_rp=1)
-            if not gopay and auto_register_gopay:
-                gopay = _do_register()
-            if not gopay:
-                # 注册也没成（或没开自动注册）：退而求其次取最新一条已注册的号，
-                # 后面靠 wait_for_balance 轮询等红包/充值到账。
-                gopay = _latest_gopay_account()
-            if not gopay:
-                raise RuntimeError("没有可用的 GoPay 账号，且无法自动注册")
-    out["gopay_account_id"] = int(gopay.id)
-    log(f"使用 GoPay 账号 #{gopay.id}（{gopay.email}）")
+            acc = None
+            if source == "pool":
+                acc = pick_available_gopay_account(min_balance_rp=1) or _latest_gopay_account()
+                if not acc:
+                    raise RuntimeError("GoPay 号来源=号池：池里没有可用号（且不允许注册）")
+                log("GoPay 号来源=号池：复用已有号")
+            else:
+                acc = pick_available_gopay_account(min_balance_rp=1)
+                if not acc and auto_register_gopay:
+                    acc = _do_register()
+                if not acc:
+                    acc = _latest_gopay_account()
+                if not acc:
+                    raise RuntimeError("没有可用的 GoPay 账号，且无法自动注册")
+        out["gopay_account_id"] = int(acc.id)
+        log(f"使用 GoPay 账号 #{acc.id}（{acc.email}）")
 
-    # **需求 1**：余额不足不直接判失败——resume client 后轮询【领红包→查余额】
-    # 直到余额 ≥ 1 或 20 分钟号码有效期超时。
-    current_balance = int((_account_extra(gopay).get("balance_rp")) or 0)
-    if current_balance < 1:
-        log(f"GoPay 号 #{gopay.id} 当前余额 {current_balance} IDR，开始轮询等红包/充值到账…")
-        gopay_extra = _account_extra(gopay)
-        phone = str(gopay_extra.get("phone") or gopay.email or "").strip()
-        register_proxy = _normalize_proxy_url(
-            str(gopay_extra.get("register_proxy") or proxy or "").strip()
-        )
-        client = _resolve_gopay_client(phone, register_proxy, log=log)
-        if client is None:
-            raise RuntimeError(f"GoPay 号 #{gopay.id} 无法 resume（拿不到 client），无法轮询余额")
-        final_balance = wait_for_balance(
-            client=client,
-            envelope_url=envelope_url,
-            ttl_guard=ttl_guard,
+        # 余额不足轮询【领红包→查余额】直到 ≥ 1 或号码有效期超时。
+        current_balance = int((_account_extra(acc).get("balance_rp")) or 0)
+        if current_balance < 1:
+            log(f"GoPay 号 #{acc.id} 当前余额 {current_balance} IDR，开始轮询等红包/充值到账…")
+            gopay_extra = _account_extra(acc)
+            phone = str(gopay_extra.get("phone") or acc.email or "").strip()
+            register_proxy = _normalize_proxy_url(
+                str(gopay_extra.get("register_proxy") or proxy or "").strip()
+            )
+            client = _resolve_gopay_client(phone, register_proxy, log=log)
+            if client is None:
+                raise RuntimeError(f"GoPay 号 #{acc.id} 无法 resume（拿不到 client），无法轮询余额")
+            final_balance = wait_for_balance(
+                client=client,
+                envelope_url=envelope_url,
+                ttl_guard=ttl_guard,
+                log=log,
+            )
+            from core.account_graph import patch_account_graph
+
+            with Session(engine) as session:
+                m = session.get(AccountModel, int(acc.id))
+                if m:
+                    patch_account_graph(session, m, summary_updates={"balance_rp": final_balance})
+                    session.commit()
+
+        # 抓包模式：把账号信息打印出来，并用浏览器脚本驱动 GoPay 网页付款。
+        if capture_payment:
+            _ex = _account_extra(acc)
+            _phone = str(_ex.get("phone") or acc.email or "")
+            _pin = str(_ex.get("pin") or acc.password or "")
+            _bal = int(_ex.get("balance_rp") or 0)
+            _aid = str(_ex.get("herosms_activation_id") or "")
+            _provider = str(_ex.get("sms_provider") or sms_provider or "smspool")
+            log(
+                "==================== 浏览器付款用的 GoPay 账号 ====================\n"
+                f"[capture]   GoPay 手机号 : {_phone}\n"
+                f"[capture]   GoPay PIN    : {_pin}\n"
+                f"[capture]   当前余额     : {_bal} IDR\n"
+                f"[capture]   账号 #{acc.id}（已注册+设PIN+查余额完成）\n"
+                "==============================================================="
+            )
+            # 浏览器脚本驱动付款（page 由 after_grab 传入）
+            if _page is not None:
+                try:
+                    from platforms.gopay.browser_pay import gopay_browser_pay
+
+                    wait_otp, _sms_done = _build_payment_sms_callbacks(
+                        provider=_provider,
+                        aid=_aid,
+                        herosms_api_key=herosms_api_key_override,
+                        smspool_api_key=smspool_api_key,
+                        smsbower_api_key=smsbower_api_key,
+                        smsapi_url=smsapi_url,
+                        smsapi_phone=smsapi_phone,
+                        log=log,
+                    )
+                    log("[capture] 开始浏览器脚本付款（输手机号→同意→OTP→PIN→Pay now）…")
+                    pay_res = gopay_browser_pay(
+                        _page,
+                        phone=_phone,
+                        pin=_pin,
+                        wait_otp=wait_otp,
+                        timeout_seconds=240,
+                        log=log,
+                    )
+                    out["payment"] = pay_res
+                    log(f"[capture] 浏览器付款结果: {pay_res}")
+                    try:
+                        _sms_done()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    log(f"[capture] 浏览器付款异常: {exc}")
+            else:
+                log("[capture] 未拿到浏览器 page，跳过自动付款（可手动操作）")
+        return acc
+
+    if not midtrans_url_override:
+        ttl_guard.check()
+        if not cashier_url_override:
+            out["cashier_url"] = step_generate_cashier_url(
+                chatgpt,
+                country=country,
+                currency=currency,
+                proxy=proxy,
+                log=log,
+            )
+        cashier_url = out["cashier_url"]
+
+        # ② 浏览器抓 midtrans_url（自动选 GoPay + 填表 + 点订阅）
+        ttl_guard.check()
+        # 浏览器出口代理：显式 proxy 优先，否则从代理池取一个印尼代理。
+        # camoufox 走 Playwright/Chromium——**必须用 http/https 代理**（带认证
+        # 的 socks5 Chromium 不支持），所以代理池里请放 http/https 的印尼代理。
+        # 有代理时 select_gopay_and_grab_midtrans 会自动开 geoip + 印尼时区/语言，
+        # 让指纹和地理对齐（直连 + 默认 en-US 时区会被 GoPay 风控判异常）。
+        browser_proxy = proxy
+        if not browser_proxy:
+            try:
+                from core.proxy_pool import proxy_pool
+
+                picked = proxy_pool.get_next(region="ID") or ""
+                if picked:
+                    browser_proxy = _normalize_proxy_url(picked)
+                    log(f"代理池分配：{_mask_proxy(browser_proxy)}（GoPay 抓 midtrans 浏览器用）")
+                else:
+                    log("代理池没有可用代理，浏览器抓 midtrans 回退直连（指纹可能过不了 GoPay 风控）")
+            except Exception as exc:
+                log(f"代理池调用异常，浏览器抓 midtrans 回退直连：{exc}")
+        out["midtrans_url"] = step_grab_midtrans_url(
+            cashier_url,
+            checkout_mode=checkout_mode,
+            bit_profile_id=bit_profile_id,
+            proxy=browser_proxy,
+            timeout_seconds=grab_timeout,
+            capture_dir=effective_capture_dir,
+            # 抓包模式：浏览器抓到 midtrans 后保持打开，用 after_grab 在浏览器
+            # 开着的同时跑 GoPay 注册/设PIN/查余额，把账号准备好给人工手动付款。
+            after_grab=(_prepare_gopay_account if capture_payment else None),
+            cancel_check=cancel_check,
             log=log,
         )
-        # 余额到账，写回 graph
-        from core.account_graph import patch_account_graph
+    midtrans_url = out["midtrans_url"]
 
-        with Session(engine) as session:
-            m = session.get(AccountModel, int(gopay.id))
-            if m:
-                patch_account_graph(session, m, summary_updates={"balance_rp": final_balance})
-                session.commit()
+    # 抓包模式：到这里 after_grab 已经在浏览器开着时跑完注册/设PIN/查余额，
+    # 人工也已在 midtrans 付款页手动付完款。不跑协议付款，直接返回。
+    if capture_payment:
+        log("[capture] 抓包完成（GoPay 账号已注册+设PIN+查余额；协议付款已跳过，由人工手动付款）")
+        out["captured"] = True
+        out["capture_dir"] = effective_capture_dir
+        return out
+
+    # ③ 选/注册 GoPay 号 + 查余额 + 协议付款
+    ttl_guard.check()
+    gopay = _prepare_gopay_account()
 
     ttl_guard.check()
     out["payment"] = step_pay_with_gopay(
@@ -976,9 +1308,36 @@ def execute_gopay_pay_chatgpt(
         herosms_api_key_override=herosms_api_key_override,
         smspool_api_key_override=smspool_api_key,
         smsbower_api_key_override=smsbower_api_key,
+        smsapi_url_override=smsapi_url,
         sms_provider_override=sms_provider,
         log=log,
     )
+
+    # #2：付款成功后自动换绑，把当前 GoPay 号占用的（印尼）号释放出来。
+    if auto_rebind and isinstance(out.get("payment"), dict) and out["payment"].get("success"):
+        try:
+            g_extra = _account_extra(gopay)
+            g_phone = str(g_extra.get("phone") or gopay.email or "").strip()
+            g_pin = str(g_extra.get("pin") or gopay.password or "").strip()
+            g_proxy = _normalize_proxy_url(str(g_extra.get("register_proxy") or proxy or ""))
+            log(f"付款成功，开始自动换绑释放号 {g_phone}…")
+            client = _resolve_gopay_client(g_phone, g_proxy, log=log)
+            if client is None:
+                log("自动换绑跳过：无法 resume GoPay client")
+            else:
+                rb = rebind_release_phone(
+                    client, pin=g_pin,
+                    rebind_provider=rebind_provider,
+                    rebind_sms_key=rebind_sms_key,
+                    rebind_country=rebind_country,
+                    rebind_service=rebind_service,
+                    log=log,
+                )
+                out["rebind"] = rb
+                log(f"自动换绑结果: {rb}")
+        except Exception as exc:
+            log(f"自动换绑异常（忽略，不影响付款结果）: {exc}")
+            out["rebind"] = {"success": False, "detail": str(exc)}
 
     # 把 ChatGPT 账号标 SUBSCRIBED 并存 cashier_url / midtrans_url
     # （chatgpt_account_id=0 占位场景跳过——没有关联的 ChatGPT 账号）

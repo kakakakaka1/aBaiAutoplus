@@ -47,57 +47,6 @@ CUSTOMER_BASE = "https://customer.gopayapi.com"
 PIN_CLIENT_LINKING = "51b5f09a-3813-11ee-be56-0242ac120002-MGUPA"
 PIN_CLIENT_PAYMENT = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 
-# X-Snap-Signature（Midtrans Snap 请求签名）。来自抓包文档 2026-06-02：
-#   Signing Key : 1feab063-bf3f-4025-90bf-3be6fa4f4cc2
-#   Payload     : {absolute_path}:{timestamp_ms}:{minified_json_body}
-#   sig_hex     = HMAC-SHA256(key, payload)
-#   Mangle      : 每 4 字符一组交换 [c0,c1,c2,c3] -> [c2,c3,c0,c1]
-SNAP_SIGN_KEY = os.environ.get(
-    "OPAI_MIDTRANS_SNAP_SIGN_KEY", "1feab063-bf3f-4025-90bf-3be6fa4f4cc2"
-)
-
-
-def _snap_mangle(sig_hex: str) -> str:
-    """每 4 字符一组做 [c0,c1,c2,c3] -> [c2,c3,c0,c1] 交换；不足 4 的尾部原样保留。"""
-    chars = list(sig_hex)
-    length = len(chars)
-    for i in range(0, length - 3, 4):
-        r = chars[i]
-        o = chars[i + 1]
-        chars[i] = chars[i + 2]
-        chars[i + 1] = chars[i + 3]
-        chars[i + 2] = r
-        chars[i + 3] = o
-    return "".join(chars)
-
-
-def _snap_signature(path: str, body_text: str, ts: str) -> str:
-    """生成 X-Snap-Signature。
-
-    path: ``/snap`` 前缀的绝对路径（不含 host、不含 query）
-    body_text: 紧凑 JSON body（与实际发送字节一致）；GET/无 body 传空串
-    ts: **秒级**时间戳字符串（与 X-Timestamp header 同值）
-    """
-    full_path = path if path.startswith("/snap") else f"/snap{path}"
-    payload = f"{full_path}:{ts}:{body_text or ''}"
-    sig_hex = hmac.new(
-        SNAP_SIGN_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
-    return _snap_mangle(sig_hex)
-
-
-def _tls_proxy(proxy: str) -> str:
-    """把 ``socks5h://`` 归一成 ``socks5://`` 供 tls_client 使用。
-
-    tls_client 的 Go 后端不支持 ``socks5h`` scheme，会报
-    "scheme socks5h is not supported"。socks5 在它下面默认远程 DNS，等价。
-    其它 scheme（http/https/socks5）原样返回。
-    """
-    p = str(proxy or "").strip()
-    if p.lower().startswith("socks5h://"):
-        return "socks5://" + p[len("socks5h://"):]
-    return p
-
 
 class GoPayPaymentError(Exception):
     pass
@@ -113,16 +62,64 @@ class GoPayPayment:
     def __init__(self, proxy: str = ""):
         self._session = tls_client.Session(client_identifier="chrome_120")
         if proxy:
-            # tls_client（Go 后端）只认 ``socks5://``，不认 ``socks5h://``
-            # （会报 "scheme socks5h is not supported"）。注册侧用 httpx 需要
-            # socks5h（远程 DNS），付款侧用 tls_client 这里归一成 socks5。
-            # socks5 在 tls_client 下默认也走远程 DNS，等价可用。
-            proxy = _tls_proxy(proxy)
             self._session.proxies = {"http": proxy, "https": proxy}
         self._headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _mangle_signature(signature_str: str) -> str:
+        """
+        置换混淆算法 (Signature Mangling)。
+        对于每 4 个字符 [c0, c1, c2, c3]，交换第一对 [c0, c1] 与第二对 [c2, c3]。
+        """
+        chars = list(signature_str)
+        length = len(chars)
+        for i in range(0, length - 3, 4):
+            r = chars[i]
+            o = chars[i+1]
+            chars[i] = chars[i+2]
+            chars[i+1] = chars[i+3]
+            chars[i+2] = r
+            chars[i+3] = o
+        return "".join(chars)
+
+    def _generate_snap_headers(self, path: str, body_dict: dict = None) -> dict:
+        """
+        为 Midtrans 请求生成所需的 X-Snap-Signature 和 X-Timestamp 等头信息。
+        """
+        signing_key = "1feab063-bf3f-4025-90bf-3be6fa4f4cc2"
+        timestamp = str(int(time.time()))
+        
+        # 1. 序列化请求体为无空格的 JSON 紧凑格式
+        body_str = ""
+        if body_dict is not None:
+            body_str = json.dumps(body_dict, separators=(',', ':'))
+            
+        # 2. 拼接相对路径（必须为包含 /snap 前缀的绝对路径）
+        full_path = f"/snap{path}" if not path.startswith("/snap") else path
+        message = f"{full_path}:{timestamp}:{body_str}"
+        
+        # 3. 计算 HMAC-SHA256
+        sig_hex = hmac.new(
+            signing_key.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        # 4. 置换混淆
+        mangled_sig = self._mangle_signature(sig_hex)
+        
+        # 5. 合并并返回完整 headers
+        return {
+            **self._headers,
+            "X-Source": "snap",
+            "X-Source-App-Type": "redirection",
+            "X-Source-Version": "2.3.0",
+            "X-Timestamp": timestamp,
+            "X-Snap-Signature": mangled_sig,
         }
 
     @staticmethod
@@ -147,29 +144,11 @@ class GoPayPayment:
                             return found
         return ""
 
-    def _snap_headers(self, path: str, body_text: str = "", extra_headers: dict = None) -> dict:
-        """生成 Midtrans Snap 请求头：X-Snap-Signature + X-Timestamp（秒）+ X-Source*。
-
-        签名 payload 里的 timestamp 必须和 ``X-Timestamp`` header 完全一致；
-        服务端还要求 X-Source / X-Source-App-Type / X-Source-Version 这组头。
-        """
-        ts = str(int(time.time()))  # **秒级**，不是毫秒
-        h = dict(self._headers)
-        try:
-            h["X-Snap-Signature"] = _snap_signature(path, body_text, ts)
-            h["X-Timestamp"] = ts
-            h["X-Source"] = "snap"
-            h["X-Source-App-Type"] = "redirection"
-            h["X-Source-Version"] = "2.3.0"
-        except Exception as exc:
-            log.warning("X-Snap-Signature 生成失败（继续不带签名）: %s", exc)
-        if extra_headers:
-            h.update(extra_headers)
-        return h
-
     def _midtrans_get(self, path: str, extra_headers: dict = None, timeout: int = 15) -> dict:
         url = f"{MIDTRANS_BASE}{path}"
-        headers = self._snap_headers(path, "", extra_headers)
+        headers = self._generate_snap_headers(path)
+        if extra_headers:
+            headers.update(extra_headers)
         r = self._session.get(url, headers=headers, timeout_seconds=timeout)
         log.debug("[MT GET] %s → %d", path, r.status_code)
         try:
@@ -179,9 +158,10 @@ class GoPayPayment:
 
     def _midtrans_post(self, path: str, body: dict, extra_headers: dict = None, timeout: int = 15) -> dict:
         url = f"{MIDTRANS_BASE}{path}"
-        body_text = json.dumps(body, separators=(",", ":"))
-        headers = self._snap_headers(path, body_text, extra_headers)
-        r = self._session.post(url, headers=headers, data=body_text, timeout_seconds=timeout)
+        headers = self._generate_snap_headers(path, body)
+        if extra_headers:
+            headers.update(extra_headers)
+        r = self._session.post(url, headers=headers, data=json.dumps(body), timeout_seconds=timeout)
         log.debug("[MT POST] %s → %d", path, r.status_code)
         try:
             return {"status": r.status_code, "body": r.json()}
@@ -190,7 +170,9 @@ class GoPayPayment:
 
     def _midtrans_delete(self, path: str, extra_headers: dict = None, timeout: int = 15) -> dict:
         url = f"{MIDTRANS_BASE}{path}"
-        headers = self._snap_headers(path, "", extra_headers)
+        headers = self._generate_snap_headers(path)
+        if extra_headers:
+            headers.update(extra_headers)
         r = self._session.delete(url, headers=headers, timeout_seconds=timeout)
         log.debug("[MT DELETE] %s → %d", path, r.status_code)
         try:
@@ -243,8 +225,6 @@ class GoPayPayment:
         country_code: str,
         pin: str,
         wait_otp: Callable[[str, int], Optional[str]] = None,
-        otp_total_timeout: int = 120,
-        otp_resend_after: int = 60,
     ) -> dict:
         """
         执行完整的 GoPay 支付流程。
@@ -255,9 +235,6 @@ class GoPayPayment:
             country_code: 国际码（如 62）
             pin: 6 位 GoPay PIN
             wait_otp: 等待 OTP 的回调函数 (phone, timeout) → code or None
-            otp_total_timeout: 等 OTP 的总超时秒数（默认 120=2 分钟）
-            otp_resend_after: 第一段等待多少秒没收到码就重新触发 GoPay
-                发码（默认 60=1 分钟），之后继续等到总超时
 
         Returns:
             {"success": bool, "detail": str, "transaction_status": str}
@@ -271,27 +248,26 @@ class GoPayPayment:
 
         # === Phase A: Linking ===
 
-        # 先拉交易详情，取商户 client_key（linking 的 Basic Authorization 用）。
-        log.info("[pay] 拉交易详情取 client_key…")
+        # Fetch transaction details to extract the correct merchant client_key
+        log.info("[pay] Fetching transaction details...")
         tx_r = self._midtrans_get(f"/snap/v1/transactions/{snap}")
-        client_key = ""
-        if tx_r["status"] == 200 and isinstance(tx_r.get("body"), dict):
-            client_key = tx_r["body"].get("merchant", {}).get("client_key", "")
+        if tx_r["status"] != 200:
+            return {"success": False, "detail": f"failed to fetch transaction info: {tx_r['status']} body: {tx_r['body']}"}
+        client_key = tx_r["body"].get("merchant", {}).get("client_key", "")
         if not client_key:
-            log.warning("[pay] 未取到 client_key（继续尝试不带 Authorization）: %s", tx_r["status"])
-        link_extra = {}
-        if client_key:
-            auth_str = base64.b64encode(f"{client_key}:".encode("utf-8")).decode("utf-8")
-            link_extra = {"Authorization": f"Basic {auth_str}"}
-            log.info("[pay] client_key=%s", client_key)
+            return {"success": False, "detail": "client_key not found in transaction info"}
+        log.info("[pay] Extracted client_key: %s", client_key)
 
         # Step 1: linking
         log.info("[pay] Step 1: linking")
+        auth_str = base64.b64encode(f"{client_key}:".encode('utf-8')).decode('utf-8')
+        extra_headers = {"Authorization": f"Basic {auth_str}"}
+        
         link_r = self._midtrans_post(f"/snap/v3/accounts/{snap}/linking", {
             "type": "gopay",
             "country_code": country_code,
             "phone_number": phone,
-        }, extra_headers=link_extra)
+        }, extra_headers=extra_headers)
         if link_r["status"] == 429:
             return {"success": False, "detail": "linking 429 rate limited"}
         if link_r["status"] == 406:
@@ -303,13 +279,11 @@ class GoPayPayment:
                 "type": "gopay",
                 "country_code": country_code,
                 "phone_number": phone,
-            }, extra_headers=link_extra)
+            }, extra_headers=extra_headers)
             if link_r["status"] == 406:
                 return {"success": False, "detail": "still linked after unlink attempt"}
         if link_r["status"] not in (200, 201):
-            link_body_str = json.dumps(link_r.get("body", {}), ensure_ascii=False)[:400]
-            log.warning("[pay] linking failed: %d body=%s", link_r["status"], link_body_str)
-            return {"success": False, "detail": f"linking failed: {link_r['status']} {link_body_str}"}
+            return {"success": False, "detail": f"linking failed: {link_r['status']} body: {link_r['body']}"}
 
         # 从 response 提取 reference
         body = link_r["body"]
@@ -338,11 +312,11 @@ class GoPayPayment:
 
         time.sleep(1)
 
-        # Step 4: resend-otp (强制 SMS)
-        log.info("[pay] Step 4: resend-otp (force SMS)")
+        # Step 4: resend-otp
+        log.info("[pay] Step 4: resend-otp (WhatsApp)")
         resend = self._gwa_post("/v1/linking/resend-otp", {
             "reference_id": reference,
-            "otp_channel": "SMS",
+            "otp_channel": "WHATSAPP",
         })
         log.info("[pay] resend-otp: %d", resend["status"])
 
@@ -350,32 +324,8 @@ class GoPayPayment:
         if not wait_otp:
             return {"success": False, "detail": "no OTP callback provided"}
         full_phone = f"+{country_code}{phone}"
-
-        def _trigger_gopay_resend() -> None:
-            r = self._gwa_post("/v1/linking/resend-otp", {
-                "reference_id": reference,
-                "otp_channel": "SMS",
-            })
-            log.info("[pay] resend-otp(retry): %d", r["status"])
-
-        # 分段等待：先等 otp_resend_after 秒；没收到就重新触发 GoPay 发码，
-        # 再等剩余时间到 otp_total_timeout。两段都拿不到才算 OTP timeout。
-        total = max(int(otp_total_timeout or 0), 1)
-        first_wait = max(min(int(otp_resend_after or 0), total), 0)
-        otp_code = None
-        if first_wait > 0:
-            log.info("[pay] Waiting for OTP on %s (first %ds)...", full_phone, first_wait)
-            otp_code = wait_otp(full_phone, first_wait)
-        if not otp_code:
-            remaining = total - first_wait
-            if remaining > 0:
-                log.info("[pay] OTP not received in %ds, re-triggering GoPay resend...", first_wait)
-                try:
-                    _trigger_gopay_resend()
-                except Exception as exc:
-                    log.warning("[pay] resend-otp retry failed: %s", exc)
-                log.info("[pay] Waiting for OTP on %s (remaining %ds)...", full_phone, remaining)
-                otp_code = wait_otp(full_phone, remaining)
+        log.info("[pay] Waiting for OTP on %s...", full_phone)
+        otp_code = wait_otp(full_phone, 120)
         if not otp_code:
             return {"success": False, "detail": "OTP timeout"}
         log.info("[pay] OTP: %s", otp_code)

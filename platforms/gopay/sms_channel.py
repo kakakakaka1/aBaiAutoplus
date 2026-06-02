@@ -428,3 +428,184 @@ def patch_worker_with_smsbower(
     _worker.sms_cancel = _cancel
     _worker.sms_done = _done
     log.info("gopay worker sms 函数已切换到 SMSBower 渠道")
+
+
+# ---------------------------------------------------------------------------
+# SmsApi（自有卡 / 固定号 + 查最新短信 API）
+# ---------------------------------------------------------------------------
+# 形态：用户提供一个**固定手机号**（自己的实体卡 / 长期租用号）+ 一个查询
+# 「该号最新一条短信」的 API URL（带 token）。没有"租号 / 释放号"概念。
+#
+# 示例 API:
+#   GET https://api.sms8.net/api/record?token=xxxx
+#   resp: {"code":1,"msg":"ok","data":{
+#            "code":"(GoTo) Use 5328 as OTP for your GoPay app. ...",
+#            "code_time":"2026-06-02 21:24:31",
+#            "expired_date":"..."}}
+#
+# OTP 从 data.code 文本里正则抠 4-6 位数字；用 data.code_time 区分"新 / 旧"
+# 短信（注册→PIN→付款多次 OTP 复用同一个号，必须只认比上次更新的那条）。
+
+SMSAPI_DEFAULT_URL = os.environ.get("OPAI_SMSAPI_URL", "")
+SMSAPI_DEFAULT_PHONE = os.environ.get("OPAI_SMSAPI_PHONE", "")
+
+
+def _smsapi_normalize_phone(phone: str) -> str:
+    """统一成 ``+62xxxxxxxxxx`` 形态。"""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if digits.startswith("0"):
+        digits = "62" + digits[1:]
+    if not digits.startswith("62"):
+        digits = "62" + digits
+    return "+" + digits
+
+
+class SmsApiChannel:
+    """固定手机号 + 查最新短信 API 的接码渠道。
+
+    与 worker 期望的 (phone, id) 元组语义对齐：``get_number`` 直接返回固定号，
+    ``id`` 用号本身占位（这套 API 不需要 activation_id）。``wait_code`` 轮询
+    record API，靠 ``code_time`` 只认新到达的短信。
+    """
+
+    def __init__(self, *, url: str, phone: str):
+        self.url = str(url or "").strip() or SMSAPI_DEFAULT_URL
+        self.phone = _smsapi_normalize_phone(phone or SMSAPI_DEFAULT_PHONE)
+        # 记录"已经见过的最新短信时间"，用于区分新旧 OTP。初始化为基线，
+        # 这样首次 wait 只认本次请求之后到达的新短信。
+        self._last_seen_time: str = ""
+
+    def _fetch(self) -> dict:
+        """请求 record API，返回 ``data`` dict（失败返回 {}）。"""
+        try:
+            s = _new_session()
+            r = s.get(self.url, timeout_seconds=30)
+            try:
+                j = r.json()
+            except Exception:
+                return {}
+            if not isinstance(j, dict):
+                return {}
+            if int(j.get("code") or 0) != 1:
+                log.debug("smsapi non-ok resp: %s", str(j)[:200])
+                return {}
+            data = j.get("data")
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            log.debug("smsapi fetch failed: %s", exc)
+            return {}
+
+    @staticmethod
+    def _extract_code(text: str) -> str | None:
+        """从短信正文抠 OTP（优先 4-6 位连续数字）。"""
+        m = re.search(r"\b(\d{4,6})\b", str(text or ""))
+        return m.group(1) if m else None
+
+    def prime(self) -> None:
+        """快照当前最新短信时间作为基线（拿号后、等码前调一次）。"""
+        data = self._fetch()
+        self._last_seen_time = str(data.get("code_time") or "")
+        log.info("smsapi 基线短信时间=%s", self._last_seen_time or "(空)")
+
+    def get_number(self) -> tuple[str | None, str | None]:
+        """固定号，无需租。返回 (phone, phone) —— id 用号占位。"""
+        if not self.url:
+            log.warning("smsapi 未配置查询 URL")
+            return None, None
+        # 拿号即把当前短信时间设为基线，避免把注册前的旧码当 OTP。
+        self.prime()
+        log.info("smsapi 使用固定号 %s", self.phone)
+        return self.phone, self.phone
+
+    def wait_code(self, _id: str, timeout: int = SMS_TIMEOUT) -> str | None:
+        """轮询 record API，拿到比基线更新的那条短信里的 OTP。"""
+        deadline = time.monotonic() + max(int(timeout or 0), 0)
+        while time.monotonic() < deadline:
+            data = self._fetch()
+            code_time = str(data.get("code_time") or "")
+            body = str(data.get("code") or "")
+            if body and code_time and code_time != self._last_seen_time:
+                code = self._extract_code(body)
+                if code:
+                    self._last_seen_time = code_time
+                    log.info("smsapi 新短信 time=%s code=%s", code_time, code)
+                    return code
+            time.sleep(5)
+        log.warning("smsapi 等码超时（last_seen=%s）", self._last_seen_time)
+        return None
+
+    def request_another(self, _id: str) -> bool:
+        """这套 API 没有"重发"概念——发码由 GoPay 触发，这里只重置基线，
+        让下一次 wait_code 只认更新的短信。"""
+        data = self._fetch()
+        self._last_seen_time = str(data.get("code_time") or self._last_seen_time)
+        return True
+
+    def cancel(self, _id: str) -> None:
+        return None
+
+    def done(self, _id: str) -> None:
+        return None
+
+
+def patch_worker_with_smsapi(*, url: str, phone: str) -> None:
+    """覆盖 ``gopay_protocol_worker`` 的 5 个 sms 函数走 SmsApi（固定号）。
+
+    与 ``patch_worker_with_smspool`` 同一思路。固定号 + 查最新短信 API，
+    靠 code_time 区分新旧 OTP，一个号跨注册/PIN/付款多次 OTP 都能用。
+    """
+    from opai.core import gopay_protocol_worker as _worker
+
+    channel = SmsApiChannel(url=url, phone=phone)
+
+    def _get_number(_api_key):
+        return channel.get_number()
+
+    def _wait_code(_api_key, _id, timeout: int = SMS_TIMEOUT):
+        return channel.wait_code(_id, timeout=timeout)
+
+    def _request_another(_api_key, _id):
+        return channel.request_another(_id)
+
+    def _cancel(_api_key, _id):
+        channel.cancel(_id)
+
+    def _done(_api_key, _id):
+        channel.done(_id)
+
+    _worker.sms_get_number = _get_number
+    _worker.sms_wait_code = _wait_code
+    _worker.sms_request_another = _request_another
+    _worker.sms_cancel = _cancel
+    _worker.sms_done = _done
+    log.info("gopay worker sms 函数已切换到 SmsApi 渠道（固定号 %s）", channel.phone)
+
+
+# ---------------------------------------------------------------------------
+# Hero-SMS（换绑用临时号）—— SMS-Activate 风格，买外国便宜号释放印尼号
+# ---------------------------------------------------------------------------
+
+HEROSMS_REBIND_API = "https://hero-sms.com/stubs/handler_api.php"
+# 换绑目标号默认买泰国（country=52），service=ni（与参考 gopay换绑.txt 一致）。
+# 只为占位释放旧印尼号，越便宜越好，可用 env / 参数覆盖。
+HEROSMS_REBIND_DEFAULT_COUNTRY = os.environ.get("OPAI_REBIND_COUNTRY", "52")
+HEROSMS_REBIND_DEFAULT_SERVICE = os.environ.get("OPAI_REBIND_SERVICE", "ni")
+
+
+def make_herosms_rebind_channel(
+    api_key: str = "",
+    *,
+    service: str = "",
+    country: str = "",
+) -> SmsActivateStyleChannel:
+    """构造换绑用的 Hero-SMS 渠道（买外国临时号接换绑 OTP）。
+
+    与 GoPay 注册渠道独立：换绑只是为了把账号迁到一个新号上，从而释放
+    当前占用的印尼号。新号买最便宜的外国号即可（默认泰国）。
+    """
+    return SmsActivateStyleChannel(
+        base_url=HEROSMS_REBIND_API,
+        api_key=str(api_key or "").strip(),
+        service=str(service or "").strip() or HEROSMS_REBIND_DEFAULT_SERVICE,
+        country=str(country or "").strip() or HEROSMS_REBIND_DEFAULT_COUNTRY,
+    )
