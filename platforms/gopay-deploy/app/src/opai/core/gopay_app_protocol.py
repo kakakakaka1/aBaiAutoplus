@@ -834,12 +834,13 @@ class GoPayProtocol:
         }
         return self.post(AUTH, "/goto-auth/device-verification/login", body)
 
-    def token(self, *, verification_token: Optional[str] = None, authorization_code: Optional[str] = None, refresh_token: Optional[str] = None, account_id: str = "", ext_user_token: Optional[str] = None) -> Tuple[int, Any, Dict[str, str]]:
+    def token(self, *, verification_token: Optional[str] = None, authorization_code: Optional[str] = None, refresh_token: Optional[str] = None, challenge_token: Optional[str] = None, account_id: str = "", ext_user_token: Optional[str] = None) -> Tuple[int, Any, Dict[str, str]]:
         # Flutter AOT exact toJson at libapp.so+0xbbdbe4:
         #   {grant_type, account_id, token, client_id, client_secret, ext_user_token}
         # `grant_type` is an enum->string map, not "verification_token" /
         # "authorization_code".  For CVS OTP it is "cvs"; for auth-code
-        # exchange it is "auth_code"; refresh remains "refresh_token".
+        # exchange it is "auth_code"; refresh remains "refresh_token";
+        # 登录 2FA 的 2fa_token 用 "challenge"。
         body: Dict[str, Any] = {
             "grant_type": "",
             "account_id": account_id,
@@ -850,6 +851,8 @@ class GoPayProtocol:
         }
         if verification_token:
             body.update({"grant_type": "cvs", "token": verification_token})
+        elif challenge_token:
+            body.update({"grant_type": "challenge", "token": challenge_token})
         elif authorization_code:
             body.update({"grant_type": "auth_code", "token": authorization_code})
         elif refresh_token:
@@ -891,6 +894,30 @@ class GoPayProtocol:
         if otp_auth_token:
             extra["otp_auth_token"] = otp_auth_token
         return self.post(API, "/v2/users/pin", body, auth=access_token, extra_headers=extra)
+
+    # ------------------------------------------------------------------
+    # 换绑手机号（改绑新号 + 释放旧号）—— 来自 20260602/gopay换绑.txt
+    # ------------------------------------------------------------------
+    def customers_update_phone(self, access_token: str, new_phone: str, pin: str, email: str = "", signed_up_country: str = "ID") -> Tuple[int, Any, Dict[str, str]]:
+        """PATCH api.gojekapi.com/v5/customers —— 发起换绑，返回 otp_token。
+
+        body: {phone, signed_up_country, email}；header 带 ``pin``。
+        new_phone 形如 ``+62...`` 或 ``+66...``（新号）。
+        """
+        body = {
+            "phone": new_phone,
+            "signed_up_country": signed_up_country,
+            "email": email,
+        }
+        return self._send(
+            "PATCH", API, "/v5/customers", body,
+            auth=access_token, extra_headers={"pin": pin},
+        )
+
+    def customers_verify_update(self, access_token: str, otp: str, otp_token: str) -> Tuple[int, Any, Dict[str, str]]:
+        """POST api.gojekapi.com/v5/customers/verificationUpdateProfile —— 提交换绑 OTP。"""
+        body = {"otp": otp, "otp_token": otp_token}
+        return self.post(API, "/v5/customers/verificationUpdateProfile", body, auth=access_token)
 
 
 # ===========================================================================
@@ -1102,3 +1129,47 @@ class GoPayAppClient:
             self.proto.close()
         except Exception:
             pass
+
+    # --- 换绑手机号（改绑新号 + 释放旧号）---------------------------------
+    def rebind_phone(self, *, new_phone: str, pin: str, wait_otp, email: str = "",
+                     signed_up_country: str = "ID", otp_timeout: int = 180, log=None) -> dict:
+        """把当前登录账号从旧号换绑到 ``new_phone`` 并释放旧号。
+
+        步骤：
+          1. PATCH /v5/customers (pin header) -> otp_token
+          2. wait_otp(new_phone, timeout) 从新号接 OTP
+          3. POST /v5/customers/verificationUpdateProfile -> 完成
+
+        Args:
+            new_phone: 新手机号（+62 / +66 等，带国码）
+            pin: 当前账号 6 位 PIN
+            wait_otp: 拿新号 OTP 的回调 (phone, timeout) -> code|None
+            email: 换绑同时可改邮箱（可空）
+
+        Returns: {"success": bool, "detail": str, "new_phone": str}
+        """
+        _log = log or (lambda *_a, **_k: None)
+        at = self.auth.access_token
+        sc, data, _ = self.proto.customers_update_phone(
+            at, new_phone, pin, email=email, signed_up_country=signed_up_country,
+        )
+        if not is_success_response(sc, data):
+            return {"success": False, "detail": f"update_phone 失败 HTTP {sc}: {data}", "new_phone": new_phone}
+        otp_token = pick_first(data, ["otp_token", "otpToken"])
+        if not otp_token:
+            return {"success": False, "detail": f"update_phone 未返回 otp_token: {data}", "new_phone": new_phone}
+        _log(f"[rebind] 已提交换绑到 {new_phone}，等待新号 OTP…")
+
+        code = None
+        try:
+            code = wait_otp(new_phone, otp_timeout)
+        except Exception as exc:
+            return {"success": False, "detail": f"等换绑 OTP 异常: {exc}", "new_phone": new_phone}
+        if not code:
+            return {"success": False, "detail": "换绑 OTP 超时/未拿到", "new_phone": new_phone}
+
+        sc, data, _ = self.proto.customers_verify_update(at, str(code), str(otp_token))
+        if not is_success_response(sc, data):
+            return {"success": False, "detail": f"verify_update 失败 HTTP {sc}: {data}", "new_phone": new_phone}
+        _log(f"[rebind] 换绑成功，旧号已释放，新号 {new_phone}")
+        return {"success": True, "detail": "rebind ok", "new_phone": new_phone}

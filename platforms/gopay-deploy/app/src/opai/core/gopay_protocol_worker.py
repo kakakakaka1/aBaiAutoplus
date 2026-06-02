@@ -353,7 +353,13 @@ class _PhoneAlreadyRegistered(RuntimeError):
     pass
 
 
-def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Optional[dict]:
+class _RebindFailed(RuntimeError):
+    """号已注册、auto_rebind 换绑释放失败：不换号重试，直接判任务失败。"""
+    pass
+
+
+def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str,
+                  *, auto_rebind: bool = False, rebind_acquire=None) -> Optional[dict]:
     """完整注册 + 设 PIN（GoPay App 纯协议, com.gojek.gopay 2.10.0）。
 
     流程移植自 ``gopay-auto-protocol``（gopay:consumer:app + enhanced X-E1）：
@@ -361,6 +367,11 @@ def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Opti
       -> refresh 成正常 goto-auth session -> goto_pin_wa_sms 二次 OTP -> 设 PIN。
     设备指纹复用主项目的 ``generate_device_identity(seed)``（同号同指纹）。
     返回契约不变：``{phone, aid, pin, client, local}``。
+
+    ``auto_rebind`` + ``rebind_acquire``：拿到的号若**已被注册**，不直接放弃，
+    而是登录该已注册账号 -> 换绑到临时外国号 -> 释放本号 -> 用释放干净的本号
+    重新走注册。``rebind_acquire()`` 返回 ``(new_phone, wait_otp, finish, cancel)``
+    （由 application 层 ``_build_rebind_otp_callback`` 提供，换绑渠道独立于注册）。
     """
     phone, aid = sms_get_number(api_key)
     if not phone:
@@ -395,8 +406,36 @@ def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Opti
             gp.new_cvs_session()
             sc, data, _ = gp.cvs_methods(local, flow="signup", country_code=country_code)
         elif sc in (200, 201, 202):
-            log.info("[%s] Already registered, skipping", phone)
-            return None
+            log.info("[%s] Already registered", phone)
+            # 号已被注册：auto_rebind 开启则登录该账号 -> 换绑释放本号 -> 重注册。
+            if auto_rebind and callable(rebind_acquire):
+                freed = _rebind_release_registered(
+                    phone, pin, proxy, rebind_acquire=rebind_acquire,
+                    login_api_key=api_key, login_sms_id=aid,
+                )
+                if not freed:
+                    # 换绑释放失败（异设备登录已注册号常被 GoPay 拒）：放弃本号，
+                    # 取消该接码号退回平台（finally 里 _deferred_cancel_phone 会
+                    # setStatus=8/cancel），并标记换号重试。
+                    log.warning("[%s] 号已注册且换绑释放失败，放弃本号并退回接码平台、换新号", phone)
+                    try:
+                        sms_cancel(api_key, aid)
+                    except Exception:
+                        pass
+                    return None
+                log.info("[%s] 已换绑释放，重新走注册", phone)
+                gp.new_cvs_session()
+                sc, data, _ = gp.cvs_methods(local, flow="signup", country_code=country_code)
+                if not is_success_response(sc, data):
+                    sc2, data2, _ = gp.login_methods(local, country_code)
+                    if not has_error_code(data2, "auth:error:user:not_found"):
+                        log.warning("[%s] 换绑释放后号仍未变 not_found，放弃", phone)
+                        return None
+                    gp.new_cvs_session()
+                    sc, data, _ = gp.cvs_methods(local, flow="signup", country_code=country_code)
+            else:
+                log.info("[%s] Already registered, skipping（未开 auto_rebind）", phone)
+                return None
         elif is_waf_html(sc, data) or sc == 403:
             log.warning("[%s] WAF 403, need new proxy IP", phone)
             return None
@@ -494,6 +533,7 @@ def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Opti
         customer_id = extract_account_id(data if isinstance(data, dict) else {}) or str(account_id or "")
 
         # === Phase 6: 设 PIN（goto_pin_wa_sms 二次 CVS OTP）===
+        log.info("[%s] 进入设 PIN 阶段（pin_allowed）", phone)
         sc, data, _ = gp.pin_allowed(str(access_token), pin)
         if not is_success_response(sc, data):
             log.error("[%s] pin_allowed failed: HTTP %d %s", phone, sc, data)
@@ -526,14 +566,26 @@ def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Opti
             log.error("[%s] pin_cvs_initiate no otp_token", phone)
             return None
 
-        pin_code = sms_wait_code(api_key, aid, timeout=180)
-        if not pin_code:
-            log.warning("[%s] PIN OTP timeout, retry once via cvs_retry_pin", phone)
-            sc, data_r, _ = gp.cvs_retry_pin(str(access_token), str(pin_otp_token), method=pin_method)
-            if is_success_response(sc, data_r, allow=(200, 201, 202, 204)):
-                pin_otp_token = _pick_first(data_r, ["otp_token", "otpToken"]) or pin_otp_token
+        # PIN OTP 拿码：每 60 秒一段，没拿到新码就重新触发 GoPay 发码
+        # （cvs_retry_pin），而不是死等 180 秒。最多 3 段。``ignore_code=otp``
+        # 排除注册阶段的旧码（herosms setStatus=3 后会回 STATUS_WAIT_RETRY:<旧码>）。
+        pin_code = None
+        for pin_round in range(1, 4):
+            pin_code = sms_wait_code(api_key, aid, timeout=60, ignore_code=str(otp or ""))
+            if pin_code:
+                break
+            if pin_round < 3:
+                log.warning("[%s] PIN OTP 60s 没到，重新触发 GoPay 发码（第 %d 次）", phone, pin_round)
+                sc, data_r, _ = gp.cvs_retry_pin(str(access_token), str(pin_otp_token), method=pin_method)
+                if is_success_response(sc, data_r, allow=(200, 201, 202, 204)):
+                    pin_otp_token = _pick_first(data_r, ["otp_token", "otpToken"]) or pin_otp_token
+                else:
+                    # retry 不行就重新 initiate 一次
+                    sc, data_i, _ = gp.cvs_initiate_pin(str(access_token), str(pin_vid), method=pin_method)
+                    if is_success_response(sc, data_i, allow=(200, 201, 202, 204)):
+                        pin_otp_token = _pick_first(data_i, ["otp_token", "otpToken"]) or pin_otp_token
                 sms_request_another(api_key, aid)
-                pin_code = sms_wait_code(api_key, aid, timeout=180)
+                time.sleep(2)
         if not pin_code:
             log.error("[%s] PIN OTP not received", phone)
             return None
@@ -578,6 +630,9 @@ def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Opti
         success = True
         return {"phone": phone, "aid": aid, "pin": pin, "client": client, "local": local}
 
+    except _RebindFailed:
+        # 换绑释放失败：不吞，向上抛让 plugin 直接判任务失败（不换号重试）。
+        raise
     except Exception as e:
         log.exception("[%s] Registration exception: %s", phone, e)
         return None
@@ -588,6 +643,227 @@ def _register_one(api_key: str, pin: str, proxy: str, envelope_did: str) -> Opti
             except Exception:
                 pass
             _deferred_cancel_phone(api_key, aid, phone, rented_at)
+
+
+def _login_one(phone: str, pin: str, proxy: str, *, use_pin: bool = False, api_key: str = "", sms_id: str = "") -> Optional[dict]:
+    """登录一个**已注册**的 GoPay 号（login_1fa）。
+
+    用于"号已注册、要复用"的场景（换绑前先登录拿 client）。验证方式：
+      - **默认走 OTP**（otp_sms）：因为别人注册的号我们不知道它的 PIN，只能
+        靠这个号现在在手里（接码平台租到的）收短信登录。``api_key`` + ``sms_id``
+        指向注册时拿号的同一个接码渠道/订单（同号续接 OTP）。
+      - use_pin=True 且我们确知 PIN 时，才用 goto_pin 强登（一般用不到）。
+
+    返回与 _register_one 相同契约：``{phone, aid, pin, client, local}``。
+    """
+    country_code, local = "+62", str(phone or "").lstrip("+")
+    if local.startswith("62"):
+        local = local[2:]
+    phone_e164 = f"+62{local}"
+    # 接码渠道的短信 id：smspool=order_id / herosms·smsbower=activation_id。
+    # 没传则回退用手机号（仅对个别渠道有效）。
+    sms_id = str(sms_id or "").strip() or phone_e164
+
+    device = build_device_profile(phone_e164)
+    gp = GoPayProtocol(
+        device=device, signer=_make_app_signer(),
+        client_id=_GP_AUTH_ID, client_secret=_GP_AUTH_SECRET,
+        debug=False, proxy=proxy,
+    )
+    aid = ""
+    try:
+        gp.new_cvs_session()
+        sc, data, _ = gp.login_methods(local, country_code)
+        methods = _pick_first(data, ["methods", "allowed_methods"]) or []
+        default_method = str(_pick_first(data, ["default_method"]) or "")
+        # login_methods 不一定回 verification_id，要 cvs_methods(login_1fa)
+        sc, data, _ = gp.cvs_methods(local, flow="login_1fa", country_code=country_code)
+        if not is_success_response(sc, data):
+            log.error("[%s] login cvs_methods failed: HTTP %d %s", phone_e164, sc, data)
+            return None
+        vid = _pick_first(data, ["verification_id", "challenge_id"])
+        methods = _pick_first(data, ["methods"]) or methods
+        default_method = str(_pick_first(data, ["default_method"]) or default_method or "otp_sms")
+        if not vid:
+            log.error("[%s] login no verification_id", phone_e164)
+            return None
+
+        verification_token = None
+        # --- PIN 强登 ---
+        if use_pin and isinstance(methods, list) and "goto_pin" in methods:
+            log.info("[%s] login via PIN (goto_pin)", phone_e164)
+            sc, data, _ = gp.cvs_verify(local, str(vid), str(pin), method="goto_pin",
+                                        flow="login_1fa", country_code=country_code)
+            if is_success_response(sc, data):
+                verification_token = _pick_first(data, ["verification_token", "verificationToken"])
+            else:
+                log.warning("[%s] PIN 强登失败，回退 OTP: HTTP %d %s", phone_e164, sc, data)
+
+        # --- OTP 登录 ---
+        if not verification_token:
+            method = "otp_sms" if (isinstance(methods, list) and "otp_sms" in methods) else (default_method or "otp_sms")
+            sc, data, _ = gp.cvs_initiate(local, str(vid), method=method, flow="login_1fa", country_code=country_code)
+            if not is_success_response(sc, data, allow=(200, 201, 202, 204)):
+                log.error("[%s] login cvs_initiate failed: HTTP %d %s", phone_e164, sc, data)
+                return None
+            otp_token = _pick_first(data, ["otp_token", "otpToken"])
+            # 用注册时同一个接码订单/aid 续接这条登录 OTP。
+            try:
+                sms_request_another(api_key, sms_id)
+            except Exception:
+                pass
+            otp = sms_wait_code(api_key, sms_id, timeout=180)
+            if not otp:
+                log.error("[%s] login OTP timeout", phone_e164)
+                return None
+            sc, data, _ = gp.cvs_verify(local, str(vid), str(otp), method=method, flow="login_1fa",
+                                        country_code=country_code, otp_token=str(otp_token) if otp_token else None)
+            if not is_success_response(sc, data):
+                log.error("[%s] login cvs_verify failed: HTTP %d %s", phone_e164, sc, data)
+                return None
+            verification_token = _pick_first(data, ["verification_token", "verificationToken"])
+
+        gp.clear_cvs_session()
+        if not verification_token:
+            log.error("[%s] login no verification_token", phone_e164)
+            return None
+
+        access_token = None
+        refresh_token = None
+
+        # 路线 A（与 signup 成功路径一致）：直接用 cvs_verify 的 verification_token
+        # 兑换 token（account_id 用手机号 local）。signup 阶段这样能成，先试它。
+        sc, data_tok, _ = gp.token(verification_token=str(verification_token), account_id=local)
+        log.info("[%s] login token(direct) -> HTTP %d: %s",
+                 phone_e164, sc, json.dumps(data_tok, ensure_ascii=False)[:200])
+        access_token = _pick_first(data_tok, ["access_token", "accessToken"])
+        refresh_token = _pick_first(data_tok, ["refresh_token", "refreshToken"])
+
+        # 路线 B（直接兑换没成）：accountlist -> 1fa_token -> token。
+        account_id = ""
+        if not access_token:
+            sc, data_acct, _ = gp.accountlist(str(verification_token))
+            if not is_success_response(sc, data_acct):
+                log.error("[%s] login accountlist failed: HTTP %d %s", phone_e164, sc, data_acct)
+                return None
+            log.info("[%s] login accountlist 原始响应: %s",
+                     phone_e164, json.dumps(data_acct, ensure_ascii=False)[:800])
+            acct_inner = data_acct.get("data", data_acct) if isinstance(data_acct, dict) else {}
+            acct_list = acct_inner.get("account_list") if isinstance(acct_inner, dict) else None
+            if isinstance(acct_list, list) and acct_list:
+                first = acct_list[0]
+                account_id = str(first.get("account_id") or first.get("id") or "")
+            if not account_id:
+                account_id = str(_pick_first(data_acct, ["account_id", "accountid"]) or "")
+            one_fa = _pick_first(data_acct, ["1fa_token", "one_fa_token", "token"])
+            if not account_id or not one_fa:
+                log.error("[%s] login accountlist no account_id/1fa_token", phone_e164)
+                return None
+            log.info("[%s] login accountlist 解析: account_id=%s 1fa_token=%s…",
+                     phone_e164, account_id, str(one_fa)[:24])
+
+            # 1FA token 兑换：登录可能先 403 + 2fa_token，需要第二段 OTP（login_2fa）。
+            sc, data_tok, _ = gp.token(verification_token=str(one_fa), account_id=str(account_id))
+            log.info("[%s] login 1FA token 兑换 -> HTTP %d: %s",
+                     phone_e164, sc, json.dumps(data_tok, ensure_ascii=False)[:300])
+            access_token = _pick_first(data_tok, ["access_token", "accessToken"])
+        refresh_token = _pick_first(data_tok, ["refresh_token", "refreshToken"])
+
+        if not access_token and sc == 403:
+            twofa_token = _pick_first(data_tok, ["2fa_token", "twofa_token"])
+            twofa_vid = _pick_first(data_tok, ["verification_id", "challenge_id"]) or vid
+            if not twofa_token:
+                log.error("[%s] login 需要 2FA 但未拿到 2fa_token: %s", phone_e164, data_tok)
+                return None
+            log.info("[%s] login 需要 2FA，走第二段 OTP", phone_e164)
+            gp.new_cvs_session()
+            sc, d2, _ = gp.cvs_initiate(local, str(twofa_vid), method="otp_sms",
+                                        flow="login_2fa", country_code=country_code)
+            if not is_success_response(sc, d2, allow=(200, 201, 202, 204)):
+                log.error("[%s] login_2fa initiate failed: HTTP %d %s", phone_e164, sc, d2)
+                return None
+            otp_token2 = _pick_first(d2, ["otp_token", "otpToken"])
+            try:
+                sms_request_another(api_key, sms_id)
+            except Exception:
+                pass
+            otp2 = sms_wait_code(api_key, sms_id, timeout=180)
+            if not otp2:
+                log.error("[%s] login_2fa OTP timeout", phone_e164)
+                return None
+            sc, d2v, _ = gp.cvs_verify(local, str(twofa_vid), str(otp2), method="otp_sms",
+                                       flow="login_2fa", country_code=country_code,
+                                       otp_token=str(otp_token2) if otp_token2 else None)
+            if not is_success_response(sc, d2v):
+                log.error("[%s] login_2fa verify failed: HTTP %d %s", phone_e164, sc, d2v)
+                return None
+            gp.clear_cvs_session()
+            # 用 challenge grant + 2fa_token 兑换最终 token
+            sc, data_tok, _ = gp.token(challenge_token=str(twofa_token), account_id=str(account_id))
+            access_token = _pick_first(data_tok, ["access_token", "accessToken"])
+            refresh_token = _pick_first(data_tok, ["refresh_token", "refreshToken"])
+
+        if not access_token:
+            log.error("[%s] login token exchange failed: HTTP %d %s", phone_e164, sc, data_tok)
+            return None
+
+        client = GoPayAppClient(
+            gp, phone=phone_e164, local=local, user_uuid=str(account_id),
+            access_token=str(access_token), refresh_token=str(refresh_token or ""),
+        )
+        log.info("[%s] login success (account_id=%s)", phone_e164, account_id)
+        return {"phone": phone_e164, "aid": phone_e164, "pin": pin, "client": client, "local": local}
+    except Exception as e:
+        log.exception("[%s] login exception: %s", phone_e164, e)
+        try:
+            gp.close()
+        except Exception:
+            pass
+        return None
+
+
+def _rebind_one(client, *, new_phone: str, pin: str, wait_otp, email: str = "", otp_timeout: int = 180) -> dict:
+    """对已登录的 GoPayAppClient 执行换绑（改绑新号 + 释放旧号）。"""
+    if not hasattr(client, "rebind_phone"):
+        return {"success": False, "detail": "client 不支持 rebind_phone（非 GoPayAppClient）"}
+    return client.rebind_phone(
+        new_phone=new_phone, pin=pin, wait_otp=wait_otp,
+        email=email, otp_timeout=otp_timeout, log=log.info,
+    )
+
+
+def _rebind_release_registered(phone: str, pin: str, proxy: str, *, rebind_acquire,
+                               login_api_key: str = "", login_sms_id: str = "") -> bool:
+    """号已被注册时：登录该账号（OTP）-> 换绑到换绑渠道临时号 -> 释放本号。
+
+    ``rebind_acquire()`` -> ``(new_phone, wait_otp, finish, cancel)``：换绑渠道
+    （独立于注册渠道）买好临时号并给出接码回调。返回 True 表示本号已释放。
+
+    登录走 **OTP**（不知道这号的 PIN，但号在手里能收短信）。``login_api_key`` /
+    ``login_sms_id`` 指向注册时拿号的同一接码渠道/订单（同号续接登录 OTP）。
+    换绑这步本身仍需账号 PIN——若这号是本项目用同一 PIN 注册的就能成；别人
+    注册的、PIN 未知的号换绑会失败（属预期，无法释放）。
+    """
+    # OTP 登录已注册账号（号在手里能收短信；不试 PIN 强登，因为可能不知道 PIN）
+    logged = _login_one(phone, pin, proxy, use_pin=False, api_key=login_api_key, sms_id=login_sms_id)
+    if not logged or not logged.get("client"):
+        log.warning("[%s] 已注册账号登录失败，无法换绑释放", phone)
+        return False
+    client = logged["client"]
+
+    new_phone, wait_otp, finish, cancel = rebind_acquire()
+    if not new_phone:
+        log.warning("[%s] 换绑临时号获取失败", phone)
+        return False
+    res = _rebind_one(client, new_phone=new_phone, pin=pin, wait_otp=wait_otp)
+    ok = bool(res.get("success"))
+    try:
+        (finish if ok else cancel)()
+    except Exception:
+        pass
+    if not ok:
+        log.warning("[%s] 换绑失败: %s", phone, res.get("detail"))
+    return ok
 
 
 # ---------------------------------------------------------------------------

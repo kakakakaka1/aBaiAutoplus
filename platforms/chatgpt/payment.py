@@ -7967,13 +7967,38 @@ def _gopay_capture_dir() -> str:
     return str(os.environ.get("OPAI_GOPAY_CAPTURE_DIR", "") or "").strip()
 
 
-def _dump_all_pages_html(context, capture_dir: str, seen: set, counter: list, log) -> None:
-    """把当前所有打开页面的 HTML dump 到 capture_dir，按 (url, html-hash) 去重。"""
+def _capture_context_pages(page):
+    """从 page 拿到真正的 Playwright BrowserContext 和它的所有 page。
+
+    注意：抓包传进来的是业务 page，``page.context`` 才是真正的
+    Playwright BrowserContext（带 ``.pages`` / ``.close()``）。之前误把
+    camoufox 的上下文管理器 wrapper 当 context，导致 ``.pages`` 取不到、
+    一进循环就误判"所有页面已关闭"。
+    """
     try:
-        pages = list(getattr(context, "pages", []) or [])
+        ctx = page.context
     except Exception:
-        pages = []
+        ctx = None
+    pages = []
+    if ctx is not None:
+        try:
+            pages = list(ctx.pages or [])
+        except Exception:
+            pages = []
+    if not pages:
+        pages = [page]
+    return ctx, pages
+
+
+def _dump_all_pages_html(page, capture_dir: str, seen: set, counter: list, log) -> None:
+    """把当前所有打开页面的 HTML dump 到 capture_dir，按 (url, html-hash) 去重。"""
+    _ctx, pages = _capture_context_pages(page)
     for pg in pages:
+        try:
+            if pg.is_closed():
+                continue
+        except Exception:
+            pass
         try:
             url = str(pg.url or "")
             html = pg.content()
@@ -8003,12 +8028,12 @@ def _dump_all_pages_html(context, capture_dir: str, seen: set, counter: list, lo
             log(f"[capture] dump HTML 失败: {exc}")
 
 
-def _manual_capture_loop(context, page, capture_dir: str, *, max_minutes: int, log) -> None:
+def _manual_capture_loop(page, capture_dir: str, *, max_minutes: int, log) -> None:
     """人工付款抓包循环。
 
     停止条件（任一）：``capture_dir/STOP`` 文件出现 / 超过 max_minutes /
-    所有页面关闭。期间每 3 秒扫一遍所有打开页面 dump HTML（去重），HAR 由
-    context 关闭时落盘。
+    浏览器上下文里所有页面都关闭。期间每 3 秒扫一遍所有打开页面 dump
+    HTML（去重），HAR 由 context 关闭时落盘。
     """
     Path(capture_dir).mkdir(parents=True, exist_ok=True)
     stop_file = Path(capture_dir, "STOP")
@@ -8027,18 +8052,26 @@ def _manual_capture_loop(context, page, capture_dir: str, *, max_minutes: int, l
         if stop_file.exists():
             log("[capture] 检测到 STOP 文件，结束抓包")
             break
-        try:
-            if not list(getattr(context, "pages", []) or []):
-                log("[capture] 所有页面已关闭，结束抓包")
+        # 判断是否还有存活页面：context 没了 / 所有 page 都 closed 才算结束。
+        _ctx, pages = _capture_context_pages(page)
+        alive = False
+        for pg in pages:
+            try:
+                if not pg.is_closed():
+                    alive = True
+                    break
+            except Exception:
+                alive = True
                 break
-        except Exception:
-            pass
-        _dump_all_pages_html(context, capture_dir, seen, counter, log)
+        if not alive:
+            log("[capture] 浏览器已被手动关闭，结束抓包")
+            break
+        _dump_all_pages_html(page, capture_dir, seen, counter, log)
         time.sleep(3)
     else:
         log(f"[capture] 已达最长 {max_minutes} 分钟，结束抓包")
     # 最后再 dump 一轮，确保抓到最终页
-    _dump_all_pages_html(context, capture_dir, seen, counter, log)
+    _dump_all_pages_html(page, capture_dir, seen, counter, log)
     log(f"[capture] HTML 抓取完成，共 {counter[0]} 个快照；关闭浏览器将落盘 HAR")
 
 
@@ -8050,6 +8083,7 @@ def select_gopay_and_grab_midtrans(
     timeout_seconds: int = 300,
     cancel_check: Optional[Callable[[], bool]] = None,
     capture_dir: str = "",
+    after_grab: Optional[Callable[[str], None]] = None,
     log: Callable[[str], None] = print,
 ) -> str:
     """启动浏览器（camoufox/bitbrowser）打开 cashier_url，自动选 GoPay 渠道、
@@ -8061,6 +8095,11 @@ def select_gopay_and_grab_midtrans(
     后，抓到 midtrans_url **不关浏览器**，开启 HAR 录制并停在付款页，让人工
     手动走完 GoPay 网页付款全流程，全程 dump 每个页面 HTML。在该目录新建
     ``STOP`` 文件结束抓包。
+
+    ``after_grab``：抓包模式下，抓到 midtrans_url 并导航到付款页后、进入人工
+    付款等待循环**之前**调用一次（参数为 midtrans_url）。用于在浏览器保持
+    打开的同时跑 GoPay 注册/设 PIN/查余额，把账号信息准备好给人工手动付款。
+    回调内异常不会中断抓包（只记日志）。
     """
     if backend_config is None:
         backend_config = BrowserBackendConfig.camoufox(headless=False)
@@ -8083,8 +8122,31 @@ def select_gopay_and_grab_midtrans(
     if backend_config.is_camoufox and proxy:
         proxy_config = _build_camoufox_proxy(proxy)
         if proxy_config:
+            # Chromium 不支持「带账号密码的 socks5」代理（Playwright issue
+            # #10567）。代理池里给 GoPay 浏览器用的请放 http/https 代理。
+            server = str(proxy_config.get("server") or "")
+            if server.lower().startswith("socks") and (
+                proxy_config.get("username") or proxy_config.get("password")
+            ):
+                log(
+                    "⚠ 检测到带认证的 socks5 代理——Chromium/Camoufox 不支持，"
+                    "浏览器代理大概率失效。请在代理池放 http/https 印尼代理。"
+                )
             launch_opts["proxy"] = proxy_config
+            # geoip=True：让 camoufox 按代理出口 IP 自动对齐时区 / 经纬度 /
+            # 地理位置，指纹和印尼出口 IP 一致（不开的话默认时区会和 IP
+            # 对不上，直接被 GoPay/Midtrans 风控判异常）。
             launch_opts["geoip"] = True
+            # 出口是印尼代理，locale 也对齐成印尼优先，避免 en-US + 印尼 IP
+            # 这种地理/语言不一致的指纹特征。
+            launch_opts["locale"] = ["id-ID", "en-US", "en"]
+            log(
+                f"Camoufox 走代理 + geoip 指纹对齐: {_mask_proxy(proxy)}"
+            )
+        else:
+            log(f"Camoufox 代理解析失败，回退直连: {_mask_proxy(proxy)}")
+    elif backend_config.is_camoufox and not proxy:
+        log("Camoufox 未配置代理（直连），印尼站点指纹/地理大概率过不了风控")
 
     browser_timeout_ms = max(int(timeout_seconds or 300), 30) * 1000
     address = fetch_us_billing_address()
@@ -8175,8 +8237,23 @@ def select_gopay_and_grab_midtrans(
                     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 except Exception as exc:
                     log(f"[capture] 导航 midtrans 失败（可忽略，页面可能已自动跳转）: {exc}")
+            # 浏览器开着的同时跑 GoPay 注册/设 PIN/查余额（after_grab 回调），
+            # 把可手动付款的账号准备好，再进人工付款等待循环。
+            if callable(after_grab):
+                try:
+                    log("[capture] 浏览器保持打开，后台开始准备 GoPay 账号（注册/设PIN/查余额）…")
+                    after_grab(url, page)
+                except Exception as exc:
+                    log(f"[capture] 准备 GoPay 账号失败（不中断抓包，可手动用别的号）: {exc}")
             max_minutes = int(os.environ.get("OPAI_GOPAY_CAPTURE_MAX_MIN", "20") or "20")
-            _manual_capture_loop(browser_context, page, capture_dir, max_minutes=max_minutes, log=log)
+            _manual_capture_loop(page, capture_dir, max_minutes=max_minutes, log=log)
+            # 抓包结束后显式关掉录 HAR 的那个 context，确保 HAR 落盘
+            # （即使浏览器还没整体关闭）。
+            try:
+                page.context.close()
+                log(f"[capture] HAR 已落盘: {record_har_path}")
+            except Exception as exc:
+                log(f"[capture] 关闭 capture context 落盘 HAR 失败（finally 仍会兜底）: {exc}")
         return url
     finally:
         if browser_context is not None:

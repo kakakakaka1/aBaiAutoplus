@@ -11,7 +11,7 @@ def test_grab_midtrans_accepts_checkout_mode_string(monkeypatch):
     并透传给 select_gopay_and_grab_midtrans。"""
     captured = {}
 
-    def fake_select(cashier_url, *, backend_config, proxy, timeout_seconds, capture_dir, cancel_check, log):
+    def fake_select(cashier_url, *, backend_config, proxy, timeout_seconds, capture_dir, after_grab, cancel_check, log):
         captured["backend"] = backend_config.backend
         captured["window_mode"] = backend_config.window_mode
         captured["capture_dir"] = capture_dir
@@ -36,7 +36,7 @@ def test_grab_midtrans_default_camoufox(monkeypatch):
     """checkout_mode 缺省走 camoufox_headed。"""
     captured = {}
 
-    def fake_select(cashier_url, *, backend_config, proxy, timeout_seconds, capture_dir, cancel_check, log):
+    def fake_select(cashier_url, *, backend_config, proxy, timeout_seconds, capture_dir, after_grab, cancel_check, log):
         captured["backend"] = backend_config.backend
         captured["window_mode"] = backend_config.window_mode
         return "https://app.midtrans.com/snap/v4/redirection/abc-uuid-1234"

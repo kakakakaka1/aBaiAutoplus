@@ -234,6 +234,36 @@ class GoPayPlatform(BasePlatform):
             self.log(
                 f"GoPay 协议注册启动（接码=SMSBower, PIN={pin[:2]}**, proxy={proxy or '直连'}）"
             )
+        elif sms_provider == "smsapi":
+            from platforms.gopay.sms_channel import (
+                patch_worker_with_smsapi,
+                SMSAPI_DEFAULT_URL,
+                SMSAPI_DEFAULT_PHONE,
+            )
+
+            smsapi_url = (
+                str(extra.get("smsapi_url") or "").strip()
+                or os.environ.get("OPAI_SMSAPI_URL", "").strip()
+                or SMSAPI_DEFAULT_URL
+            )
+            smsapi_phone = (
+                str(extra.get("smsapi_phone") or "").strip()
+                or os.environ.get("OPAI_SMSAPI_PHONE", "").strip()
+                or SMSAPI_DEFAULT_PHONE
+            )
+            if not smsapi_url or not smsapi_phone:
+                raise RuntimeError(
+                    "GoPay 注册接码=smsapi 需要 smsapi_phone（固定手机号）和 "
+                    "smsapi_url（查最新短信的 API URL）—— 在注册任务 extra 里填，"
+                    "或设环境变量 OPAI_SMSAPI_PHONE / OPAI_SMSAPI_URL"
+                )
+            patch_worker_with_smsapi(url=smsapi_url, phone=smsapi_phone)
+            # smsapi channel 自带号+URL；api_key 不再用，保持非空避免上游早退。
+            api_key = "smsapi"
+            self.log(
+                f"GoPay 协议注册启动（接码=SmsApi 固定号 {smsapi_phone}, "
+                f"PIN={pin[:2]}**, proxy={proxy or '直连'}）"
+            )
         else:
             api_key = _resolve_api_key(extra)
             if not api_key:
@@ -252,6 +282,27 @@ class GoPayPlatform(BasePlatform):
             )
 
         self.raise_if_cancelled()
+
+        # auto_rebind：拿到的号若已被注册，登录该账号 -> 换绑到换绑渠道临时号
+        # -> 释放本号 -> 重新注册。换绑渠道**独立于注册渠道**（注册用 smsapi
+        # 固定号时换绑仍要买一次性外国号）。
+        auto_rebind = bool(extra.get("auto_rebind"))
+        rebind_acquire = None
+        if auto_rebind:
+            rebind_provider = str(extra.get("rebind_provider") or "herosms").strip().lower()
+            rebind_sms_key = str(extra.get("rebind_sms_key") or "").strip()
+            rebind_country = str(extra.get("rebind_country") or "").strip()
+            rebind_service = str(extra.get("rebind_service") or "").strip()
+
+            def rebind_acquire():
+                from application.gopay_pay_chatgpt import _build_rebind_otp_callback
+                return _build_rebind_otp_callback(
+                    rebind_provider=rebind_provider,
+                    rebind_sms_key=rebind_sms_key,
+                    country=rebind_country,
+                    service=rebind_service,
+                    log=self.log,
+                )
 
         # 注册期间把 worker 的 Python logging 转发到 UI 任务日志，这样
         # 注册失败时能看到真实原因（号已注册 / WAF 403 / OTP 超时 等），
@@ -273,7 +324,10 @@ class GoPayPlatform(BasePlatform):
             if prev_level > logging.INFO or prev_level == logging.NOTSET:
                 opai_logger.setLevel(logging.INFO)
             try:
-                result = _register_one(api_key, pin, proxy, envelope_did)
+                result = _register_one(
+                    api_key, pin, proxy, envelope_did,
+                    auto_rebind=auto_rebind, rebind_acquire=rebind_acquire,
+                )
             finally:
                 opai_logger.removeHandler(bridge)
                 opai_logger.setLevel(prev_level)

@@ -79,12 +79,22 @@ class GoPayPayChatGptTaskRequest(BaseModel):
     sms_provider: str = "herosms"
     smspool_api_key: str = ""
     smsbower_api_key: str = ""
+    # smsapi（固定手机号 + 查最新短信 API）渠道
+    smsapi_url: str = ""
+    smsapi_phone: str = ""
     herosms_api_key: str = ""
     # 拿号价格上限（USD），herosms 与 smspool 共用。空串走插件默认（0.11）。
     max_price: str = ""
     # GoPay 号来源开关：auto（先池后注册）/ pool（只用号池，没号失败）/
     # register（强制现注册新号，忽略号池/指定号）。
     gopay_source: str = "auto"
+    # #2：付款成功后自动换绑（买临时外国号绑上去，释放当前印尼号）。
+    auto_rebind: bool = False
+    # 换绑专用接码渠道（独立于注册渠道）：herosms / smsbower。
+    rebind_provider: str = "herosms"
+    rebind_sms_key: str = ""
+    rebind_country: str = ""
+    rebind_service: str = ""
     # 调试抓包开关：开启后抓到 midtrans_url 不关浏览器，停在付款页让人工手动
     # 走完 GoPay 网页付款，全程录 HAR + dump 每页 HTML，不跑协议付款。
     capture_payment: bool = False

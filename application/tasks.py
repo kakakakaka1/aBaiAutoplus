@@ -1588,11 +1588,26 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
     sms_provider = str(payload.get("sms_provider") or "herosms").strip().lower()
     smspool_api_key = str(payload.get("smspool_api_key") or "")
     smsbower_api_key = str(payload.get("smsbower_api_key") or "")
+    # smsapi（固定号 + 查最新短信 API）渠道参数
+    smsapi_url = str(payload.get("smsapi_url") or "")
+    smsapi_phone = str(payload.get("smsapi_phone") or "")
     # 拿号价格上限（USD）。herosms 与 smspool 都用 USD 计价，默认 0.11；
     # 空串交给插件用默认值。
     max_price = str(payload.get("max_price") or "").strip()
     # GoPay 号来源：auto（默认，先池后注册）/ pool（只用池）/ register（强制注册）。
     gopay_source = str(payload.get("gopay_source") or "auto").strip().lower()
+    # #2：付款成功后自动换绑，把 GoPay 号占用的印尼号释放出来。
+    _rebind_raw = payload.get("auto_rebind")
+    auto_rebind = (
+        _rebind_raw is True
+        or str(_rebind_raw or "").strip().lower() in ("1", "true", "yes", "on")
+    )
+    # 换绑专用接码渠道（独立于注册渠道——注册用 smsapi 固定号时换绑仍要买
+    # 一次性外国号）。默认 herosms。
+    rebind_provider = str(payload.get("rebind_provider") or "herosms").strip().lower()
+    rebind_sms_key = str(payload.get("rebind_sms_key") or "")
+    rebind_country = str(payload.get("rebind_country") or "")
+    rebind_service = str(payload.get("rebind_service") or "")
     # 调试抓包开关（前端）：开启后抓到 midtrans_url 不关浏览器，停在付款页让
     # 人工手动走完 GoPay 网页付款，全程录 HAR + dump 每页 HTML，不跑协议付款。
     _capture_raw = payload.get("capture_payment")
@@ -1661,8 +1676,15 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
                 sms_provider=sms_provider,
                 smspool_api_key=smspool_api_key,
                 smsbower_api_key=smsbower_api_key,
+                smsapi_url=smsapi_url,
+                smsapi_phone=smsapi_phone,
                 max_price=max_price,
                 gopay_source=gopay_source,
+                auto_rebind=auto_rebind,
+                rebind_provider=rebind_provider,
+                rebind_sms_key=rebind_sms_key,
+                rebind_country=rebind_country,
+                rebind_service=rebind_service,
                 capture_payment=capture_payment,
                 capture_dir=capture_dir,
                 log=logger.log,
