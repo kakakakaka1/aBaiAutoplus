@@ -100,9 +100,9 @@
 ## 界面预览
 
 > 📸 _截图将随版本迭代持续更新。_
-### 教程联系方式
+### 交流联系方式
 
-![gopay注册生成gptplus](assets/screenshots/QQ群交流.jpg)
+![联系方式](assets/screenshots/QQ群交流.jpg)
 
 ### gopay注册生成gptplus
 
