@@ -7452,8 +7452,14 @@ def complete_paypal_checkout(
     backend_config: Optional[BrowserBackendConfig] = None,
     phone_swap_callback: Optional[Callable[[str], Optional[dict]]] = None,
     address_region: str = "US",
+    existing_page: Optional[Any] = None,
 ) -> dict:
     log = log_fn or (lambda message: logger.info(message))
+    # 短链物理复用：existing_page 非空时，不自建浏览器，直接在注册用的同一个
+    # page 上跑 PayPal checkout（短链是 ChatGPT 托管页、URL 无 token，必须用
+    # 已登录浏览器打开）。此时浏览器生命周期由调用方（注册流程）管，本函数
+    # 不开也不关浏览器，也不注入 cookie / 不跑代理出口检测（同一会话已登录）。
+    own_browser = existing_page is None
     # 没显式传 backend_config 时按 headless flag 走 Camoufox（保持
     # 老调用方/单测的行为）。BitBrowser 路径必须显式构造 backend_config。
     if backend_config is None:
@@ -7552,14 +7558,19 @@ def complete_paypal_checkout(
                 log("Camoufox 启动代理: 未配置")
         browser_context = None
         try:
-            browser_context, browser, page = _open_unique_camoufox_page(
-                launch_opts,
-                log=log,
-                browser_timeout=browser_timeout,
-                max_attempts=3,
-                record_har_path=record_har_path,
-                backend_config=backend_config,
-            )
+            if own_browser:
+                browser_context, browser, page = _open_unique_camoufox_page(
+                    launch_opts,
+                    log=log,
+                    browser_timeout=browser_timeout,
+                    max_attempts=3,
+                    record_har_path=record_har_path,
+                    backend_config=backend_config,
+                )
+            else:
+                # 短链物理复用：直接用注册流程传进来的 page，不自建浏览器。
+                page = existing_page
+                log("短链复用：在注册浏览器的同一 page 上执行 PayPal checkout（不另开浏览器）")
             _raise_if_cancelled()
             try:
                 # 命中"成功跳回 chatgpt.com / pay.openai.com"后立刻关浏览器，
@@ -7578,7 +7589,11 @@ def complete_paypal_checkout(
                 # 校验比 Firefox 严，``Storage.setCookies`` 会因 ``Invalid
                 # cookie fields`` 直接报错），也不应跑代理出口检测（业务诉求
                 # 是"BitBrowser 阶段直接打开付款链接"）。
-                if backend_config.is_bitbrowser:
+                if not own_browser:
+                    # 短链复用：同一浏览器已登录 ChatGPT，无需注入 cookie / 探代理。
+                    proxy_check = {"ok": True, "ip": "", "source": "reuse"}
+                    log("短链复用：跳过 cookie 注入与代理出口检测（同会话已登录）")
+                elif backend_config.is_bitbrowser:
                     proxy_check = {"ok": True, "ip": "", "source": "bitbrowser"}
                     log("BitBrowser 模式：跳过代理出口检测与 cookie 注入，直接打开付款链接")
                 else:
@@ -7760,6 +7775,36 @@ def complete_paypal_checkout(
                         f"host={stage_info.get('host', '')}, pathname={stage_info.get('pathname', '')}）"
                     )
 
+                # 短链物理复用（existing_page 非空 → own_browser=False）：
+                # ChatGPT 官方更新了 checkout 页（custom UI），旧的"选 PayPal
+                # 支付方式 / 填账单 / 点订阅"主动脚本选择器已全部失效（实测连续
+                # 3 次"未找到 PayPal 支付方式"）。按用户要求：短链复用时**不要**
+                # 在 checkout 页跑这套主动脚本，改成纯被动轮询——等页面（人工在
+                # headed 浏览器里点、或页面自身逻辑）跳进 PayPal 创建页 / 中间页 /
+                # CTF sandbox，再交给既有的 _finish_checkout_progress 走后续
+                # PayPal guest 创建流程。
+                if not own_browser:
+                    log(
+                        "短链复用：跳过 checkout 页主动脚本（选 PayPal / 填账单 / 点订阅），"
+                        "改为被动轮询等待进入 PayPal 创建页"
+                    )
+                    poll_deadline = time.monotonic() + max(browser_timeout, 30000) / 1000
+                    poll_interval = 3.0
+                    while time.monotonic() <= poll_deadline:
+                        _raise_if_cancelled()
+                        if _checkout_url_progressed(page, checkout_url):
+                            cur = _current_page_url(page, checkout_url)
+                            log(f"短链复用：检测到已进入 PayPal 创建页 / 下一步: {cur}")
+                            return _finish_checkout_progress(1)
+                        try:
+                            page.wait_for_timeout(int(poll_interval * 1000))
+                        except Exception:
+                            time.sleep(poll_interval)
+                    raise RuntimeError(
+                        "短链复用：等待进入 PayPal 创建页超时，仍停在 "
+                        f"{_current_page_url(page, checkout_url)}"
+                    )
+
                 for attempt in range(1, max_submit_attempts + 1):
                     _raise_if_cancelled()
                     if _checkout_url_progressed(page, checkout_url):
@@ -7788,19 +7833,20 @@ def complete_paypal_checkout(
                         page, timeout_ms=browser_timeout, log=log
                     )
                     region_label = "日本" if address.get("country") == "JP" else "美国"
-                    log(f"填写{region_label}账单信息")
-                    # 用"填写 → 校验 → 不完整重填"的循环版本，避免单次填写时
-                    # 部分字段还没渲染出来被静默跳过、最终点订阅时表单校验
-                    # 失败干等到超时判失败。GoPay 主流程已经走的同款。
-                    _run_step_with_retries(
-                        f"填写{region_label}账单信息",
-                        lambda: _fill_billing_until_complete(
-                            page, address, max_attempts=3, log=log
-                        ),
-                        page=page,
-                        log=log,
-                        cancel_check=cancel_check,
-                    )
+                    # 账单自动填写已停用：ChatGPT 官方更新了账单页结构，旧的字段
+                    # 选择器已失效，自动填只会反复未命中拖时间甚至填错。改成不
+                    # 自动填，由人工在浏览器里补（或后续按新页面结构重写选择器）。
+                    # 如需恢复，取消下面 _run_step_with_retries 那段注释。
+                    log(f"账单自动填写已停用（官方页面更新），跳过{region_label}账单自动填写")
+                    # _run_step_with_retries(
+                    #     f"填写{region_label}账单信息",
+                    #     lambda: _fill_billing_until_complete(
+                    #         page, address, max_attempts=3, log=log
+                    #     ),
+                    #     page=page,
+                    #     log=log,
+                    #     cancel_check=cancel_check,
+                    # )
                     # 上面循环已尽力填到完整，但仍可能剩缺失字段（locator
                     # 一直找不到 / Stripe 重渲染冲掉）。点击订阅前再做一次
                     # 显式快照校验：缺啥就 log 啥，不阻塞——让用户在日志里
@@ -7873,6 +7919,8 @@ def complete_paypal_checkout(
                 # except 里把 flag 置 True 了，一并跳过 hold 立即换 worker。
                 if checkout_finished_success["value"]:
                     log("checkout 终态（成功跳走或硬失败），立即关闭浏览器")
+                elif not own_browser:
+                    log("短链复用：checkout 结束，不 hold 浏览器（交回注册流程关闭）")
                 else:
                     _hold_checkout_browser(
                         page,
@@ -7882,14 +7930,16 @@ def complete_paypal_checkout(
                         cancel_check=cancel_check,
                     )
         finally:
-            if record_har_path and page is not None:
+            if own_browser and record_har_path and page is not None:
                 try:
                     page.context.close()
                     log(f"HAR 已落盘: {record_har_path}")
                 except Exception as exc:
                     log(f"HAR context 关闭失败: {exc}")
-            if browser_context is not None:
+            if own_browser and browser_context is not None:
                 browser_context.__exit__(None, None, None)
+            elif not own_browser:
+                log("短链复用：PayPal checkout 完成，浏览器交回注册流程管理（不在此关闭）")
     except Exception as exc:
         final_url = checkout_url
         try:
@@ -7959,10 +8009,12 @@ def _grab_midtrans_from_ready_page(
     if not _click_gopay_payment_method(page, log=log):
         raise RuntimeError("Stripe checkout 页没有 GoPay 支付方式，无法继续")
 
-    # 填账单信息（GoPay 印尼渠道通常只要 email/name，多填无害）。点订阅前
-    # 先做填写完整性校验：不完整就重填，最多 3 次后才放行点击订阅——避免
-    # 只填一次就点、字段没填上导致 Stripe 卡住、最后白等到超时判失败。
-    _fill_billing_until_complete(page, address, max_attempts=3, log=log)
+    # 账单自动填写已停用：ChatGPT 官方更新了账单页结构，旧的字段选择器/省份
+    # 下拉匹配已失效，自动填只会反复"未命中"拖时间。改成不填账单直接点订阅
+    # （GoPay 印尼渠道账单字段多数非必填；若页面强制要求，由人工在浏览器里补）。
+    # 如需恢复自动填写，取消下面这行注释：
+    # _fill_billing_until_complete(page, address, max_attempts=3, log=log)
+    log("账单自动填写已停用（官方页面更新），跳过填写直接点订阅")
 
     _accept_checkout_terms(page)
     # 点订阅按钮（最多 3 次，间隔 1s）。点完会跳转到 Midtrans。
@@ -8109,6 +8161,57 @@ def _manual_capture_loop(page, capture_dir: str, *, max_minutes: int, log) -> No
     log(f"[capture] HTML 抓取完成，共 {counter[0]} 个快照；关闭浏览器将落盘 HAR")
 
 
+def grab_midtrans_on_existing_page(
+    page,
+    cashier_url: str,
+    *,
+    timeout_seconds: int = 300,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    log: Callable[[str], None] = print,
+) -> str:
+    """在一个**已存在的 page**（注册用的同一浏览器）上打开 cashier_url（短链）
+    并抓 midtrans_url。
+
+    短链复用流程专用：注册浏览器没关，直接复用它的登录态打开短链
+    （chatgpt.com/checkout/openai_llc/<id>），选 GoPay → 点订阅 → 抓 midtrans。
+    账单自动填写已停用（官方页面更新），不再填账单。
+    """
+    log(f"短链复用：在注册浏览器里打开 cashier_url 并抓 midtrans（{cashier_url[:60]}…）")
+    last_nav_exc: Exception | None = None
+    for nav_attempt in range(1, 4):
+        try:
+            page.goto(cashier_url, wait_until="domcontentloaded", timeout=60_000)
+            last_nav_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_nav_exc = exc
+            msg = str(exc).lower()
+            transient = (
+                "err_socks_connection_failed" in msg
+                or "err_timed_out" in msg
+                or "err_connection_reset" in msg
+                or "err_connection_closed" in msg
+                or "err_proxy_connection_failed" in msg
+                or "err_tunnel_connection_failed" in msg
+                or "err_empty_response" in msg
+            )
+            if nav_attempt >= 3 or not transient:
+                raise
+            time.sleep(1.5 * nav_attempt)
+    if last_nav_exc is not None:
+        raise last_nav_exc
+    # address 传空 dict —— 账单自动填写已停用，_grab_midtrans_from_ready_page
+    # 内部已不再填账单。
+    return _grab_midtrans_from_ready_page(
+        page,
+        checkout_url=cashier_url,
+        address={},
+        timeout_seconds=timeout_seconds,
+        cancel_check=cancel_check,
+        log=log,
+    )
+
+
 def select_gopay_and_grab_midtrans(
     cashier_url: str,
     *,
@@ -8118,6 +8221,7 @@ def select_gopay_and_grab_midtrans(
     cancel_check: Optional[Callable[[], bool]] = None,
     capture_dir: str = "",
     after_grab: Optional[Callable[[str], None]] = None,
+    chatgpt_cookies: str = "",
     log: Callable[[str], None] = print,
 ) -> str:
     """启动浏览器（camoufox/bitbrowser）打开 cashier_url，自动选 GoPay 渠道、
@@ -8224,6 +8328,18 @@ def select_gopay_and_grab_midtrans(
             record_har_path=record_har_path,
             backend_config=backend_config,
         )
+        # 短链模式（chatgpt.com/checkout/openai_llc/<id>）：URL 里没有 token，
+        # 必须带 ChatGPT 登录态 cookie 才能打开（否则跳登录页）。这里在 goto
+        # 之前注入。BitBrowser 后端的 profile 自己持久化 cookie（且 Chromium
+        # 对 add_cookies 校验严会报错），只对 Camoufox 注入。
+        if chatgpt_cookies and backend_config.is_camoufox:
+            try:
+                page.context.add_cookies(_parse_cookie_str(chatgpt_cookies, "chatgpt.com"))
+                log("短链模式：已向 Camoufox 注入 ChatGPT 登录 cookie")
+            except Exception as exc:
+                log(f"短链 cookie 注入失败（继续，可能需要在同一浏览器登录）: {exc}")
+        elif chatgpt_cookies and backend_config.is_bitbrowser:
+            log("短链模式 + BitBrowser：依赖 profile 自身登录态（不外部注入 cookie）")
         # 并发启动 N 个 headed 浏览器时，profile 绑定的 SOCKS 代理会在同一
         # 瞬间一起握手，瞬时拥塞导致部分 goto 抛 ERR_SOCKS_CONNECTION_FAILED
         # / ERR_TIMED_OUT。对这类瞬时网络错误重试（代理真挂了重试几次照样
@@ -8448,13 +8564,18 @@ def generate_plus_link(
     country: str = "ID",
     currency: str | None = None,
     use_stripe_init: bool = False,
+    use_short_link: bool = False,
 ) -> str:
     """生成 Plus 支付链接（后端携带账号 cookie 发请求）。
 
-    ``use_stripe_init=True`` 时走 oaipayy 协议：拿到 OpenAI 的
-    ``checkout_session_id`` 后，显式调 Stripe ``payment_pages/{cs}/init`` 把
-    checkout 实体化成完整 ``pay.openai.com`` 长链（纯协议、不开浏览器，长链
-    更稳）。默认 False 时沿用原行为（直接用 OpenAI 响应里的 url）。
+    三种模式（互斥，优先级 short_link > stripe_init > 默认）：
+      - ``use_short_link=True``：走"短链"书签脚本那套——payload 用
+        ``checkout_ui_mode: "custom"`` + ``entry_point: "all_plans_pricing_modal"``
+        且**不带 promo_campaign**，拿 ``checkout_session_id`` 拼成
+        ``chatgpt.com/checkout/openai_llc/<cs_id>`` 短链返回。
+      - ``use_stripe_init=True``：oaipayy 协议，调 Stripe ``payment_pages/{cs}/init``
+        实体化成完整 ``pay.openai.com`` 长链。
+      - 默认：直接用 OpenAI 响应里的 url。
     """
     if not account.access_token:
         raise ValueError("账号缺少 access_token")
@@ -8472,16 +8593,26 @@ def generate_plus_link(
         if oai_did:
             headers["oai-device-id"] = oai_did
 
-    payload = {
-        "plan_name": "chatgptplusplan",
-        "billing_details": {"country": country, "currency": currency},
-        "cancel_url": "https://chatgpt.com/#pricing",
-        "promo_campaign": {
-            "promo_campaign_id": "plus-1-month-free",
-            "is_coupon_from_query_param": False,
-        },
-        "checkout_ui_mode": "hosted",
-    }
+    if use_short_link:
+        # 短链书签脚本的 payload：custom UI mode + all_plans_pricing_modal 入口，
+        # 不带 promo。返回 checkout_session_id 拼 chatgpt.com/checkout 短链。
+        payload = {
+            "entry_point": "all_plans_pricing_modal",
+            "plan_name": "chatgptplusplan",
+            "billing_details": {"country": country, "currency": currency},
+            "checkout_ui_mode": "custom",
+        }
+    else:
+        payload = {
+            "plan_name": "chatgptplusplan",
+            "billing_details": {"country": country, "currency": currency},
+            "cancel_url": "https://chatgpt.com/#pricing",
+            "promo_campaign": {
+                "promo_campaign_id": "plus-1-month-free",
+                "is_coupon_from_query_param": False,
+            },
+            "checkout_ui_mode": "hosted",
+        }
 
     resp = cffi_requests.post(
         PAYMENT_CHECKOUT_URL,
@@ -8494,6 +8625,16 @@ def generate_plus_link(
     resp.raise_for_status()
     data = resp.json()
     data = data if isinstance(data, dict) else {}
+
+    if use_short_link:
+        cs_id = (
+            str(data.get("checkout_session_id") or "").strip()
+            or str(data.get("cs_id") or "").strip()
+        )
+        if not cs_id:
+            raise ValueError(f"短链提取失败：OpenAI 响应没 checkout_session_id: {data.get('detail') or str(data)[:300]}")
+        logger.info("generate_plus_link: 短链 cs_id=%s", cs_id)
+        return TEAM_CHECKOUT_BASE_URL + cs_id
 
     if use_stripe_init:
         cs_id = (

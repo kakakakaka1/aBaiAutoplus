@@ -733,6 +733,7 @@ def step_generate_cashier_url(
     currency: str = "IDR",
     proxy: Optional[str] = None,
     use_stripe_init: bool = False,
+    use_short_link: bool = False,
     log: Callable[[str], None] = print,
 ) -> str:
     """步骤 ①：协议拿 ChatGPT Plus cashier URL。"""
@@ -759,7 +760,9 @@ def step_generate_cashier_url(
         )
 
     log(f"协议生成 cashier_url（country={country}, currency={currency}，不使用代理）")
-    if use_stripe_init:
+    if use_short_link:
+        log("cashier_url 走短链模式（checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc 短链）")
+    elif use_stripe_init:
         log("cashier_url 走 Stripe init 协议长链（accessToken → pay.openai.com，纯协议）")
     # 生成支付链接强制直连：ChatGPT cashier API 不需要代理，走代理反而可能
     # 因为出口 IP 与账号注册地不一致触发风控。忽略传入的 proxy。
@@ -778,6 +781,7 @@ def step_generate_cashier_url(
                 country=country,
                 currency=currency,
                 use_stripe_init=use_stripe_init,
+                use_short_link=use_short_link,
             )
             break
         except Exception as exc:  # noqa: BLE001 - 需按错误内容判断是否重试
@@ -816,15 +820,20 @@ def step_grab_midtrans_url(
     capture_dir: str = "",
     after_grab: Optional[Callable[[str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    chatgpt_cookies: str = "",
     log: Callable[[str], None] = print,
 ) -> str:
-    """步骤 ②：浏览器打开 cashier_url，自动选 GoPay 渠道、填账单、点订阅，
-    抓跳转后的 Midtrans URL 后关闭浏览器返回。
+    """步骤 ②：浏览器打开 cashier_url，自动选 GoPay 渠道、点订阅，抓跳转后的
+    Midtrans URL 后关闭浏览器返回。
 
     ``checkout_mode`` 解析成 camoufox/bitbrowser backend（同 CtfGptPlus 那套）：
       camoufox_headed / camoufox_headless / bitbrowser_headed /
       bitbrowser_hidden / bitbrowser_headless。
     bitbrowser_* 必须提供 ``bit_profile_id``。
+
+    ``chatgpt_cookies``：短链模式（chatgpt.com/checkout/openai_llc/<id>）必传。
+    短链是 ChatGPT 托管页、URL 里没有 token，打开时必须带登录态 cookie，否则
+    会跳登录页。长链（pay.openai.com）不需要。
 
     ``capture_dir`` 非空时开启调试抓包：抓到 midtrans_url 不关浏览器，停在
     付款页让人工手动付款，录 HAR + dump 每页 HTML。``after_grab`` 在抓到 url
@@ -851,6 +860,7 @@ def step_grab_midtrans_url(
         capture_dir=capture_dir,
         after_grab=after_grab,
         cancel_check=cancel_check,
+        chatgpt_cookies=chatgpt_cookies,
         log=log,
     )
 
@@ -1154,6 +1164,7 @@ def execute_gopay_pay_chatgpt(
     capture_payment: bool = False,
     capture_dir: str = "",
     use_stripe_init: bool = False,
+    use_short_link: bool = False,
     log: Callable[[str], None] = print,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -1368,6 +1379,7 @@ def execute_gopay_pay_chatgpt(
                 currency=currency,
                 proxy=proxy,
                 use_stripe_init=use_stripe_init,
+                use_short_link=use_short_link,
                 log=log,
             )
         cashier_url = out["cashier_url"]
@@ -1392,6 +1404,22 @@ def execute_gopay_pay_chatgpt(
                     log("代理池没有可用代理，浏览器抓 midtrans 回退直连（指纹可能过不了 GoPay 风控）")
             except Exception as exc:
                 log(f"代理池调用异常，浏览器抓 midtrans 回退直连：{exc}")
+        # 短链模式：抓 midtrans 的浏览器要带 ChatGPT 登录 cookie（短链是
+        # ChatGPT 托管页，URL 无 token）。从 chatgpt 账号读 cookies 透传。
+        chatgpt_cookies = ""
+        if use_short_link and chatgpt is not None:
+            try:
+                with Session(engine) as session:
+                    _acc = build_platform_account(session, chatgpt)
+                _ex = dict(getattr(_acc, "extra", {}) or {})
+                chatgpt_cookies = str(_ex.get("cookies", "") or "")
+                if chatgpt_cookies:
+                    log("短链模式：已取到 ChatGPT 登录 cookie，将注入抓 midtrans 浏览器")
+                else:
+                    log("短链模式警告：ChatGPT 账号没存 cookie，短链可能打不开（会跳登录页）")
+            except Exception as exc:
+                log(f"短链模式：读取 ChatGPT cookie 失败（继续）：{exc}")
+
         out["midtrans_url"] = step_grab_midtrans_url(
             cashier_url,
             checkout_mode=checkout_mode,
@@ -1403,6 +1431,7 @@ def execute_gopay_pay_chatgpt(
             # 开着的同时跑 GoPay 注册/设PIN/查余额，把账号准备好给人工手动付款。
             after_grab=(_prepare_gopay_account if capture_payment else None),
             cancel_check=cancel_check,
+            chatgpt_cookies=chatgpt_cookies,
             log=log,
         )
     midtrans_url = out["midtrans_url"]

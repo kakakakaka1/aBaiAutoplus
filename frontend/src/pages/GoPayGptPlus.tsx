@@ -123,6 +123,8 @@ export default function GoPayGptPlus() {
   const [capturePayment, setCapturePayment] = useState(false);
   // Stripe 协议长链：用 accessToken 直接生成 pay.openai.com cashier_url（纯协议）
   const [useStripeInit, setUseStripeInit] = useState(false);
+  // 短链：checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc 短链
+  const [useShortLink, setUseShortLink] = useState(false);
   // 付款成功后自动换绑：买一个新印尼号把账号换绑过去，老号弃用，之后一直用新号付款
   const [autoRebind, setAutoRebind] = useState(false);
   // 换绑专用接码渠道（独立于注册渠道）：herosms / smsbower
@@ -226,6 +228,7 @@ export default function GoPayGptPlus() {
         max_price: maxPrice.trim(),
         capture_payment: capturePayment,
         use_stripe_init: useStripeInit,
+        use_short_link: useShortLink,
         auto_rebind: autoRebind,
         rebind_provider: rebindProvider,
         rebind_sms_key: rebindSmsKey.trim(),
@@ -380,6 +383,28 @@ export default function GoPayGptPlus() {
                 开启后步骤①不再依赖默认接口返回的 url，而是显式调 Stripe
                 <code>payment_pages/init</code> 把 checkout 实体化成完整
                 <code>pay.openai.com</code> 长链。后续仍需浏览器把长链跳到 Midtrans 抓 midtrans_url。
+              </p>
+            )}
+          </div>
+          <div className="md:col-span-4">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={useShortLink}
+                onChange={(e) => setUseShortLink(e.target.checked)}
+                className="h-4 w-4"
+              />
+              <span className="text-[var(--text)]">
+                短链模式（checkout_ui_mode=custom，返回 chatgpt.com/checkout/openai_llc 短链）
+              </span>
+            </label>
+            {useShortLink && (
+              <p className="mt-1 text-[11px] text-[var(--text-muted)] leading-tight">
+                用 accessToken 调 checkout API（custom 模式、无优惠券），拿 checkout_session_id 拼成
+                <code>chatgpt.com/checkout/openai_llc/&lt;id&gt;</code> 短链。和 Stripe 长链二选一，短链优先。
+                <strong>短链是 ChatGPT 托管页、URL 里没有 token，打开时必须带账号登录 cookie</strong>，
+                所以会把该 ChatGPT 账号的 cookie 注入抓 midtrans 的浏览器；
+                <strong>请用 Camoufox 模式</strong>（BitBrowser 的 Chromium 注入 cookie 会被拒，需 profile 已登录）。
               </p>
             )}
           </div>

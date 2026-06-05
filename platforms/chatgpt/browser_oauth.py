@@ -63,7 +63,30 @@ def register_with_browser_oauth(
         chrome_cdp_url=chrome_cdp_url,
         log_fn=log_fn,
     ) as browser:
-        browser.goto(oauth_start.auth_url)
+        # goto 带瞬时网络错误重试（ERR_CONNECTION_CLOSED/RESET/TIMED_OUT 等
+        # 一次波动不直接判失败）。OAuthBrowser.goto 是自有封装，这里在外层
+        # 做轻量 3 次重试。
+        _nav_tokens = (
+            "err_connection", "err_timed_out", "err_network_changed",
+            "err_empty_response", "err_socks", "err_proxy", "err_tunnel",
+            "err_name_not_resolved", "err_address_unreachable",
+            "ns_error_net", "neterror", "navigating to",
+        )
+        _last_exc = None
+        for _attempt in range(1, 4):
+            try:
+                browser.goto(oauth_start.auth_url)
+                _last_exc = None
+                break
+            except Exception as _exc:  # noqa: BLE001
+                _last_exc = _exc
+                _m = str(_exc).lower()
+                if _attempt >= 3 or not any(tk in _m for tk in _nav_tokens):
+                    raise
+                log_fn(f"OAuth 打开授权页瞬时网络失败（第 {_attempt}/3 次，重试）: {str(_exc)[:120]}")
+                time.sleep(1.5 * _attempt)
+        if _last_exc is not None:
+            raise _last_exc
         time.sleep(2)
         if oauth_provider:
             browser.try_click_provider(oauth_provider)

@@ -888,6 +888,83 @@ def _auto_followup_windsurf_payment(
         logger.add_cashier_url(cashier_url)
 
 
+def _shortlink_payment_enabled(payload: dict[str, Any]) -> bool:
+    """CtfGptPlus 注册任务是否开了短链物理复用付款。"""
+    extra = dict(payload.get("extra") or {})
+    if not _bool_config(extra.get("auto_chatgpt_plus_payment"), False):
+        return False
+    payment_cfg = dict(extra.get("chatgpt_payment") or {})
+    raw = payment_cfg.get("use_short_link")
+    return raw is True or str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_inbrowser_shortlink_checkout(
+    *,
+    payload: dict[str, Any],
+    logger: "TaskLogger",
+    proxy: str | None,
+    sms_pool_override: str = "",
+):
+    """构造短链物理复用回调：注册完、浏览器还开着时，在**同一 page** 上生成
+    短链 → 打开 → 跑 PayPal checkout。返回 ``post_register_in_browser(page,
+    session_info) -> dict`` 给 ChatGPTBrowserRegister。
+
+    付款参数从 ``extra.chatgpt_payment`` 取（country/currency/超时/captcha/
+    sms_pool 等），跟 ``_auto_followup_chatgpt_plus_payment`` 一套来源，只是
+    改成在已存在 page 上跑（不另开浏览器）。
+    """
+    from platforms.chatgpt import payment as payment_module
+
+    extra = dict(payload.get("extra") or {})
+    payment_cfg = dict(extra.get("chatgpt_payment") or {})
+    country = str(payment_cfg.get("country") or "ID").strip() or "ID"
+    currency = str(payment_cfg.get("currency") or "IDR").strip() or "IDR"
+    checkout_timeout = _int_config(payment_cfg.get("checkout_timeout"), 180)
+    address_region = str(payment_cfg.get("address_region") or "US").strip().upper() or "US"
+    use_captcha = _bool_config(payment_cfg.get("use_captcha_service"), True)
+    sms_pool_raw = sms_pool_override or str(payment_cfg.get("sms_pool") or "")
+    sms_pool = []
+    try:
+        if sms_pool_raw.strip():
+            sms_pool = payment_module.parse_sms_pool(sms_pool_raw)
+    except Exception:
+        sms_pool = []
+
+    def _post_register(page, session_info: dict) -> dict:
+        class _A:
+            pass
+        a = _A()
+        a.access_token = str(session_info.get("access_token") or "")
+        a.cookies = str(session_info.get("cookies") or "")
+        if not a.access_token:
+            logger.log("短链复用(PayPal)：注册结果没有 access_token，无法生成短链")
+            return {"_shortlink_checkout": {"ok": False, "error": "no access_token"}}
+        short_url = payment_module.generate_plus_link(
+            a, proxy=None, country=country, currency=currency, use_short_link=True,
+        )
+        logger.log(f"短链已生成（PayPal 同浏览器复用）: {short_url[:70]}…")
+        # turnstile solver：默认按设置走（这里简化为 None，captcha 用页面点击 +
+        # 等待；要接 YesCaptcha 可在此按 use_captcha 注入 solver）。
+        turnstile_solver = None
+        res = payment_module.complete_paypal_checkout(
+            checkout_url=short_url,
+            cookies_str=a.cookies,
+            proxy=None,
+            email=str(session_info.get("email") or ""),
+            payment_method="paypal",
+            timeout=checkout_timeout,
+            log_fn=logger.log,
+            cancel_check=logger.is_cancel_requested,
+            turnstile_solver=turnstile_solver,
+            sms_pool=sms_pool or None,
+            address_region=address_region,
+            existing_page=page,  # 物理复用：在注册浏览器同一 page 上跑
+        )
+        return {"_shortlink_checkout": res}
+
+    return _post_register
+
+
 def _auto_followup_chatgpt_plus_payment(
     *,
     platform_name: str,
@@ -927,6 +1004,9 @@ def _auto_followup_chatgpt_plus_payment(
     # Stripe 协议长链开关（accessToken → pay.openai.com，纯协议生成 cashier_url）
     if payment_cfg.get("use_stripe_init") not in (None, ""):
         params["use_stripe_init"] = str(payment_cfg.get("use_stripe_init")).strip().lower()
+    # 短链开关（checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc 短链）
+    if payment_cfg.get("use_short_link") not in (None, ""):
+        params["use_short_link"] = str(payment_cfg.get("use_short_link")).strip().lower()
     # bitbrowser_* 模式下需要 BitBrowser 客户端里手工建好的 profile ID
     # （见 platforms/_browser_backend.py BrowserBackendConfig.bitbrowser）。
     # 留空时插件层会回退到 BIT_PROFILE_ID 环境变量。
@@ -1196,8 +1276,59 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             explicit_proxy=proxy,
             proxy_getter=proxy_pool.get_next,
         )
-        platform = _build_platform_instance(platform_name, payload, logger, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
+        # 短链物理复用（CtfGptPlus / PayPal）：注册和打开短链必须同一浏览器。
+        # 把 post_register 回调 + backend_config 注入 config.extra，让注册器在
+        # 注册完、浏览器还开着时，在同一 page 上生成短链 → 跑 PayPal checkout。
+        _shortlink_reuse = (
+            platform_name == "chatgpt" and _shortlink_payment_enabled(payload)
+        )
+        _build_payload = payload
+        _sl_acquired_profile = ""
+        if _shortlink_reuse:
+            from platforms._browser_backend import parse_checkout_mode
+            _pcfg = dict((payload.get("extra") or {}).get("chatgpt_payment") or {})
+            _ckmode = str(_pcfg.get("checkout_mode") or "camoufox_headed").strip().lower()
+            if _ckmode == "protocol":
+                _ckmode = "camoufox_headed"  # 短链复用必须用浏览器
+            # BitBrowser 模式：从池里 acquire 一个 profile（跟正常 PayPal 流程
+            # 一致），否则 backend_config 缺 profile_id 会直接报错。
+            _sl_bit_profile = str(_pcfg.get("bit_profile_id") or "")
+            if _ckmode.startswith("bitbrowser"):
+                from application.bitbrowser_profiles import acquire_profile_for_browser_mode
+                _sl_bit_profile, _sl_acquired_profile = acquire_profile_for_browser_mode(
+                    _ckmode, fallback=_sl_bit_profile, log_fn=logger.log,
+                )
+                if not _sl_bit_profile:
+                    logger.log(
+                        "短链复用：BitBrowser 池为空且未配 bit_profile_id，"
+                        "回退 Camoufox 前台",
+                        level="error",
+                    )
+                    _ckmode = "camoufox_headed"
+            _cb = _build_inbrowser_shortlink_checkout(
+                payload=payload, logger=logger, proxy=resolved_proxy,
+                sms_pool_override=slot_state["slot_value"] or sms_slot_value,
+            )
+            _reuse_extra = dict(payload.get("extra") or {})
+            _reuse_extra["_reuse_backend_config"] = parse_checkout_mode(
+                _ckmode, bit_profile_id=_sl_bit_profile,
+            )
+            _reuse_extra["_post_register_in_browser"] = _cb
+            _build_payload = dict(payload)
+            _build_payload["extra"] = _reuse_extra
+            # **关键**：短链物理复用必须走浏览器注册（headed/headless），
+            # 否则 base_platform.register 会走 ProtocolMailboxFlow（协议邮箱
+            # 注册，根本不开浏览器，post_register_in_browser 回调永远不触发）。
+            # 从付款 checkout_mode 推导注册 executor：headless 模式→headless，
+            # 其余（含 bitbrowser_*/camoufox_headed）→headed。
+            _reuse_executor = "headless" if _ckmode.endswith("_headless") else "headed"
+            _build_payload["executor_type"] = _reuse_executor
+            logger.log(
+                f"短链物理复用：注册+打开短链+PayPal 付款将在同一浏览器"
+                f"（注册执行器={_reuse_executor}, 浏览器={_ckmode}）里完成"
+            )
         try:
+            platform = _build_platform_instance(platform_name, _build_payload, logger, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
             # 失败不计进度的模式（chatgpt_plus_must_succeed）下 index 可能 > count，
             # 显示成"已成功 X/N，本次为第 M 次尝试"更直观。
             if chatgpt_plus_must_succeed:
@@ -1218,6 +1349,24 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 account=account,
                 logger=logger,
             )
+            if _shortlink_reuse:
+                # 短链复用：PayPal checkout 已在注册浏览器里跑完，结果挂在
+                # account.extra["_shortlink_checkout"]（由注册器回调合并进
+                # registration_state/result，再由 _map_chatgpt_result 透传）。
+                # 这里直接判定，不再调 _auto_followup（那会另开浏览器）。
+                _sl_res = {}
+                try:
+                    _sl_res = dict((getattr(account, "extra", {}) or {}).get("_shortlink_checkout") or {})
+                except Exception:
+                    _sl_res = {}
+                if _sl_res and not _sl_res.get("ok"):
+                    chatgpt_plus_error = f"短链复用 PayPal 付款失败: {_sl_res.get('error') or _sl_res.get('status') or 'unknown'}"
+                    logger.record_error(chatgpt_plus_error)
+                    logger.log(chatgpt_plus_error, level="error")
+                    _save_task_log(platform_name, account.email, "failed", error=chatgpt_plus_error)
+                    return chatgpt_plus_error
+                logger.log("短链复用 PayPal 付款完成（同一浏览器）")
+                return True
             chatgpt_plus_error = _auto_followup_chatgpt_plus_payment(
                 platform_name=platform_name,
                 payload=payload,
@@ -1298,6 +1447,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             # 解除 thread-local subtask 绑定，避免 ThreadPool 复用线程时
             # 把上一个任务的标签泄露到下一个任务。
             logger.clear_subtask()
+            # 短链复用从 BitBrowser 池 acquire 的 profile，跑完归还计数。
+            if _sl_acquired_profile:
+                try:
+                    from application.bitbrowser_profiles import release_acquired_profile
+                    release_acquired_profile(_sl_acquired_profile, log_fn=logger.log)
+                except Exception:
+                    pass
 
     try:
         submitted = 0
@@ -1630,20 +1786,54 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
         register_concurrency = min(
             max(int(payload.get("concurrency") or 1), 1), register_count
         )
-        try:
-            logger.log(
-                f"未选 ChatGPT 账号，先注册 {register_count} 个（并发 {register_concurrency}）"
-            )
-            chatgpt_ids = _register_chatgpt_accounts_for_gopay(
-                register_count, register_extra, logger,
-                concurrency=register_concurrency,
-            )
-        except Exception as exc:
-            logger.finish(TASK_STATUS_FAILED, error=f"ChatGPT 注册失败: {exc}")
-            return
-        if not chatgpt_ids:
-            logger.finish(TASK_STATUS_FAILED, error="ChatGPT 注册没产出任何账号")
-            return
+        # 短链模式：注册浏览器物理复用——在同一浏览器里注册→拿短链→抓 midtrans。
+        _short_link_early = payload.get("use_short_link")
+        _use_short_link_early = (
+            _short_link_early is True
+            or str(_short_link_early or "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        if _use_short_link_early:
+            try:
+                logger.log(
+                    f"短链复用模式：注册 {register_count} 个 ChatGPT，每个在同一浏览器里"
+                    f"注册→拿短链→抓 midtrans（并发 {register_concurrency}）"
+                )
+                _sl_results = _register_chatgpt_shortlink_grab_for_gopay(
+                    register_count, register_extra, logger,
+                    concurrency=register_concurrency,
+                    checkout_mode=str(payload.get("checkout_mode") or "camoufox_headed"),
+                    bit_profile_id=str(payload.get("bit_profile_id") or ""),
+                    country=str(payload.get("country") or "ID").upper(),
+                    currency=str(payload.get("currency") or "IDR").upper(),
+                    grab_timeout=max(int(payload.get("grab_timeout") or 300), 60),
+                    proxy=payload.get("proxy") or None,
+                )
+            except Exception as exc:
+                logger.finish(TASK_STATUS_FAILED, error=f"短链复用注册失败: {exc}")
+                return
+            if not _sl_results:
+                logger.finish(TASK_STATUS_FAILED, error="短链复用：没产出任何 (账号+midtrans)")
+                return
+            chatgpt_ids = [int(r["account_id"]) for r in _sl_results]
+            # 把每账号抓到的 midtrans_url 存进 payload，供付款循环按账号取用。
+            payload["_shortlink_midtrans_map"] = {
+                int(r["account_id"]): str(r["midtrans_url"]) for r in _sl_results
+            }
+        else:
+            try:
+                logger.log(
+                    f"未选 ChatGPT 账号，先注册 {register_count} 个（并发 {register_concurrency}）"
+                )
+                chatgpt_ids = _register_chatgpt_accounts_for_gopay(
+                    register_count, register_extra, logger,
+                    concurrency=register_concurrency,
+                )
+            except Exception as exc:
+                logger.finish(TASK_STATUS_FAILED, error=f"ChatGPT 注册失败: {exc}")
+                return
+            if not chatgpt_ids:
+                logger.finish(TASK_STATUS_FAILED, error="ChatGPT 注册没产出任何账号")
+                return
 
     gopay_account_id = int(payload.get("gopay_account_id") or 0) or None
     cashier_url_override = str(payload.get("cashier_url_override") or "")
@@ -1706,6 +1896,12 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
         _stripe_init_raw is True
         or str(_stripe_init_raw or "").strip().lower() in ("1", "true", "yes", "on")
     )
+    # 短链模式：checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc 短链。
+    _short_link_raw = payload.get("use_short_link")
+    use_short_link = (
+        _short_link_raw is True
+        or str(_short_link_raw or "").strip().lower() in ("1", "true", "yes", "on")
+    )
 
     total = len(chatgpt_ids)
     concurrency = min(max(int(payload.get("concurrency") or 1), 1), total)
@@ -1746,11 +1942,17 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
                     log_fn=logger.log,
                 )
             logger.log(f"[{index + 1}/{total}] 处理账号 #{chatgpt_account_id}")
+            # 短链复用模式：midtrans_url 已经在注册同浏览器里抓好了，按账号取
+            # 出来当 override 传进去，execute 内部会跳过自己的拿 cashier + 抓
+            # midtrans（不会再开新浏览器）。
+            _sl_map = payload.get("_shortlink_midtrans_map") or {}
+            _sl_midtrans = str(_sl_map.get(int(chatgpt_account_id)) or "")
+            _eff_midtrans_override = _sl_midtrans or (midtrans_url_override if use_override else "")
             out = execute_gopay_pay_chatgpt(
                 chatgpt_account_id=chatgpt_account_id,
                 gopay_account_id=gopay_account_id,
                 cashier_url_override=cashier_url_override if use_override else "",
-                midtrans_url_override=midtrans_url_override if use_override else "",
+                midtrans_url_override=_eff_midtrans_override,
                 country=country,
                 currency=currency,
                 headless=headless,
@@ -1778,6 +1980,7 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
                 capture_payment=capture_payment,
                 capture_dir=capture_dir,
                 use_stripe_init=use_stripe_init,
+                use_short_link=use_short_link,
                 log=logger.log,
                 cancel_check=logger.is_cancel_requested,
             )
@@ -1846,6 +2049,139 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
         TASK_STATUS_SUCCEEDED if success_count == total else TASK_STATUS_FAILED
     )
     logger.finish(final_status)
+
+
+def _register_chatgpt_shortlink_grab_for_gopay(
+    register_count: int,
+    register_extra: dict[str, Any],
+    logger: "TaskLogger",
+    *,
+    concurrency: int = 1,
+    checkout_mode: str = "camoufox_headed",
+    bit_profile_id: str = "",
+    country: str = "ID",
+    currency: str = "IDR",
+    grab_timeout: int = 300,
+    proxy: str | None = None,
+) -> list[dict[str, Any]]:
+    """短链复用流程：每个账号在**同一个浏览器**里注册 → 拿短链 → 打开 → 抓
+    midtrans_url，返回 ``[{"account_id", "midtrans_url"}, ...]``。
+
+    物理复用注册浏览器（不关、不换）：短链是 ChatGPT 托管页、URL 无 token，
+    必须用注册时那个已登录的浏览器打开。通过给 ChatGPTBrowserRegister 注入
+    ``post_register_in_browser`` 回调，在注册拿到 session 后、浏览器还开着时，
+    在同一 page 上 ``generate_plus_link(use_short_link)`` 拿短链 → goto → 抓
+    midtrans。支持 Camoufox / BitBrowser，N 个并发各占一个浏览器。
+    """
+    from platforms._browser_backend import parse_checkout_mode
+    from platforms.chatgpt import payment as chatgpt_payment
+
+    payload = {
+        "platform": "chatgpt",
+        "executor_type": str(register_extra.get("executor_type") or "headless"),
+        "captcha_solver": str(register_extra.get("captcha_solver") or "auto"),
+        "extra": dict(register_extra or {}),
+    }
+    concurrency = min(max(int(concurrency or 1), 1), max(int(register_count), 1))
+
+    results: list[dict[str, Any]] = []
+    results_lock = threading.Lock()
+
+    def _one(seq: int) -> None:
+        if logger.is_cancel_requested():
+            return
+        logger.set_subtask(f"reg_pay_{seq + 1}", f"注册+短链 #{seq + 1}")
+        acquired_profile = ""
+        midtrans_holder: dict[str, str] = {}
+        try:
+            resolved_proxy = _resolve_registration_proxy_for_platform(
+                "chatgpt", explicit_proxy=None, proxy_getter=lambda: None,
+            )
+            # 每个并发槽独占一个 BitBrowser profile（同 profile 不能并发开）。
+            effective_bit_profile = bit_profile_id
+            if checkout_mode.startswith("bitbrowser"):
+                from application.bitbrowser_profiles import acquire_profile_for_browser_mode
+                effective_bit_profile, acquired_profile = acquire_profile_for_browser_mode(
+                    checkout_mode, fallback=bit_profile_id, log_fn=logger.log,
+                )
+            backend_config = parse_checkout_mode(checkout_mode, bit_profile_id=effective_bit_profile)
+
+            # post_register_in_browser：注册完、浏览器还开着时，在同一 page 上
+            # 拿短链 + 抓 midtrans。
+            def _post_register(page, session_info: dict) -> dict:
+                class _A:
+                    pass
+                a = _A()
+                a.access_token = str(session_info.get("access_token") or "")
+                a.cookies = str(session_info.get("cookies") or "")
+                if not a.access_token:
+                    logger.log("短链复用：注册结果没有 access_token，无法生成短链")
+                    return {}
+                short_url = chatgpt_payment.generate_plus_link(
+                    a, proxy=None, country=country, currency=currency,
+                    use_short_link=True,
+                )
+                logger.log(f"短链已生成（同浏览器复用）: {short_url[:70]}…")
+                midtrans = chatgpt_payment.grab_midtrans_on_existing_page(
+                    page, short_url, timeout_seconds=grab_timeout,
+                    cancel_check=logger.is_cancel_requested, log=logger.log,
+                )
+                midtrans_holder["midtrans_url"] = midtrans
+                return {"midtrans_url": midtrans}
+
+            reg_extra = dict(payload["extra"])
+            reg_extra["_reuse_backend_config"] = backend_config
+            reg_extra["_post_register_in_browser"] = _post_register
+            slot_payload = dict(payload)
+            slot_payload["extra"] = reg_extra
+
+            platform = _build_platform_instance(
+                "chatgpt", slot_payload, logger, resolved_proxy=resolved_proxy,
+            )
+            account = platform.register()
+            save_account(account)
+            with Session(engine) as session:
+                fresh = session.exec(
+                    select(AccountModel)
+                    .where(AccountModel.platform == "chatgpt")
+                    .where(AccountModel.email == account.email)
+                ).first()
+                acc_id = int(fresh.id) if fresh else 0
+            midtrans_url = midtrans_holder.get("midtrans_url", "")
+            if acc_id and midtrans_url:
+                with results_lock:
+                    results.append({"account_id": acc_id, "midtrans_url": midtrans_url})
+                logger.log(f"注册+短链+抓 midtrans 成功 #{seq + 1}: {account.email} -> ...{midtrans_url[-32:]}")
+            elif acc_id:
+                logger.log(f"注册成功但没抓到 midtrans #{seq + 1}: {account.email}（短链复用失败）", level="error")
+            else:
+                logger.log(f"注册后查不到账号 #{seq + 1}", level="error")
+        except Exception as exc:
+            logger.log(f"注册+短链失败 #{seq + 1}: {exc}", level="error")
+        finally:
+            if acquired_profile:
+                try:
+                    from application.bitbrowser_profiles import release_acquired_profile
+                    release_acquired_profile(acquired_profile, log_fn=logger.log)
+                except Exception:
+                    pass
+            logger.clear_subtask()
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {}
+        next_seq = 0
+        while next_seq < register_count and len(futures) < concurrency and not logger.is_cancel_requested():
+            futures[pool.submit(_one, next_seq)] = next_seq
+            next_seq += 1
+        while futures:
+            done, _pending = wait(futures.keys(), return_when=FIRST_COMPLETED)
+            for fut in done:
+                futures.pop(fut, None)
+            while next_seq < register_count and len(futures) < concurrency and not logger.is_cancel_requested():
+                futures[pool.submit(_one, next_seq)] = next_seq
+                next_seq += 1
+
+    return results
 
 
 def _register_chatgpt_accounts_for_gopay(

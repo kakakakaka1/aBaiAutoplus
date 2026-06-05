@@ -269,6 +269,8 @@ class ChatGPTPlatform(BasePlatform):
                 "cookies": result.get("cookies", ""),
                 "profile": result.get("profile", {}),
                 "expires_at": result.get("expires_at", ""),
+                # 短链物理复用：浏览器内 PayPal checkout 结果透传给上层任务判定。
+                "_shortlink_checkout": result.get("_shortlink_checkout", None),
             },
         )
 
@@ -298,6 +300,12 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=artifacts.otp_callback,
                 phone_callback=artifacts.phone_callback,
                 log_fn=ctx.log,
+                # 短链复用流程：通过 RegisterConfig.extra 注入 backend_config
+                # （决定注册用 Camoufox 还是 BitBrowser）和 post_register_in_browser
+                # 回调（注册完不关浏览器，在同一 page 里打开短链抓 midtrans）。
+                # 普通注册这两个 key 不存在，行为不变（默认 Camoufox、无回调）。
+                backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
+                post_register_in_browser=(ctx.extra or {}).get("_post_register_in_browser"),
             ),
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(
                 email=ctx.identity.email or "",
@@ -381,6 +389,8 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "auto_checkout", "label": "自动提交 PayPal", "type": "select",
                   "options": ["true", "false"]},
                  {"key": "use_stripe_init", "label": "Stripe协议长链(accessToken直生成)", "type": "select",
+                  "options": ["false", "true"]},
+                 {"key": "use_short_link", "label": "短链(checkout_ui_mode=custom)", "type": "select",
                   "options": ["false", "true"]},
                  {"key": "payment_method", "label": "支付方式", "type": "select",
                   "options": ["paypal"]},
@@ -659,6 +669,8 @@ class ChatGPTPlatform(BasePlatform):
         # 用 Stripe payment_pages/init 协议生成 cashier_url（accessToken →
         # pay.openai.com 长链，纯协议、不开浏览器拿 cashier 链）。仅 plus 生效。
         use_stripe_init = _bool_param(params, "use_stripe_init", False)
+        # 短链：checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc 短链。仅 plus。
+        use_short_link = _bool_param(params, "use_short_link", False)
         # 账单地址来源（meiguodizhi.com 接口）："US" 走 ``/``，"JP" 走 ``/jp-address``。
         # 默认 US 保持向下兼容；其它值在 fetch_billing_address 里 fallback US。
         address_region = str(params.get("address_region") or "US").strip().upper() or "US"
@@ -749,13 +761,18 @@ class ChatGPTPlatform(BasePlatform):
 
         getattr(self, "_log_fn", print)("生成 ChatGPT 测试支付链接不使用代理")
         if plan == "plus":
-            if use_stripe_init:
+            if use_short_link:
+                getattr(self, "_log_fn", print)(
+                    "cashier_url 走短链模式（checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc）"
+                )
+            elif use_stripe_init:
                 getattr(self, "_log_fn", print)(
                     "cashier_url 走 Stripe init 协议长链（accessToken → pay.openai.com，纯协议）"
                 )
             url = payment_module.generate_plus_link(
                 a, proxy=None, country=country, currency=currency,
                 use_stripe_init=use_stripe_init,
+                use_short_link=use_short_link,
             )
         else:
             url = payment_module.generate_team_link(a, proxy=None, country=country, currency=currency)

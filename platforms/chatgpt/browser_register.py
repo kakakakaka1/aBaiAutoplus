@@ -6,7 +6,7 @@ import re
 import secrets
 import time
 import uuid
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
@@ -22,6 +22,93 @@ from .constants import (
     SENTINEL_BASE,
     OAUTH_CONSENT_FORM_SELECTOR,
 )
+
+
+def _is_transient_nav_error(exc: BaseException) -> bool:
+    """page.goto / page.reload 抛错是否属于可重试的瞬时网络断连。
+
+    覆盖 Chromium/Firefox 常见的瞬时网络错误码。业务/页面错误（4xx、选择器
+    超时等）不在此列，不会被误判重试。
+    """
+    msg = str(exc or "").lower()
+    return any(
+        token in msg
+        for token in (
+            "err_connection_closed",
+            "err_connection_reset",
+            "err_connection_refused",
+            "err_connection_aborted",
+            "err_connection_failed",
+            "err_timed_out",
+            "err_network_changed",
+            "err_empty_response",
+            "err_socks_connection_failed",
+            "err_proxy_connection_failed",
+            "err_tunnel_connection_failed",
+            "err_name_not_resolved",
+            "err_address_unreachable",
+            "ns_error_net",            # Firefox/Camoufox 网络错误前缀
+            "neterror",
+            "navigating to",           # Playwright 包装的导航失败常带这句
+        )
+    )
+
+
+def _goto_with_retry(
+    page,
+    url: str,
+    *,
+    wait_until: str = "domcontentloaded",
+    timeout: int = 30000,
+    attempts: int = 3,
+    log: Optional[Callable[[str], None]] = None,
+):
+    """``page.goto`` 带瞬时网络错误重试（默认 3 次，指数退避）。
+
+    全局统一：注册流程里所有打开页面都该走这个，避免一次网络波动
+    （ERR_CONNECTION_CLOSED / RESET / TIMED_OUT 等）就直接判失败。
+    瞬时错误重试；业务错误（页面 4xx、选择器问题）原样抛出不重试。
+    """
+    _log = log or (lambda *_a, **_k: None)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max(int(attempts), 1) + 1):
+        try:
+            return page.goto(url, wait_until=wait_until, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - 按错误内容判定是否重试
+            last_exc = exc
+            if attempt >= attempts or not _is_transient_nav_error(exc):
+                raise
+            backoff = 1.5 * attempt
+            _log(
+                f"打开页面瞬时网络失败（第 {attempt}/{attempts} 次，{backoff:.1f}s 后重试）："
+                f"{str(exc)[:120]}"
+            )
+            time.sleep(backoff)
+    if last_exc is not None:
+        raise last_exc
+
+
+def _reload_with_retry(
+    page,
+    *,
+    wait_until: str = "domcontentloaded",
+    timeout: int = 30000,
+    attempts: int = 3,
+    log: Optional[Callable[[str], None]] = None,
+):
+    """``page.reload`` 带瞬时网络错误重试。"""
+    _log = log or (lambda *_a, **_k: None)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max(int(attempts), 1) + 1):
+        try:
+            return page.reload(wait_until=wait_until, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= attempts or not _is_transient_nav_error(exc):
+                raise
+            time.sleep(1.5 * attempt)
+    if last_exc is not None:
+        raise last_exc
 
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
@@ -1503,7 +1590,7 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
     for entry_url in (PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"):
         try:
             log(f"打开 OpenAI 注册入口: {entry_url}")
-            page.goto(entry_url, wait_until="domcontentloaded", timeout=30000)
+            _goto_with_retry(page, entry_url, wait_until="domcontentloaded", timeout=30000, log=log)
         except Exception as exc:
             log(f"注册入口访问失败: {entry_url} -> {exc}")
             continue
@@ -1546,7 +1633,7 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
 
 def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -> dict:
     log("访问 ChatGPT 首页...")
-    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+    _goto_with_retry(page, f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000, log=log)
 
     log("获取 CSRF token...")
     csrf_token = _get_browser_csrf_token(page)
@@ -2416,7 +2503,7 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
 
     try:
         try:
-            page.goto(oauth_start.auth_url, wait_until="domcontentloaded", timeout=30000)
+            _goto_with_retry(page, oauth_start.auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
         except Exception as exc:
             callback_url = _extract_callback_url_from_exception(exc)
             if callback_url:
@@ -2452,7 +2539,7 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 and _oauth_url_matches_state(page_oauth_url, oauth_start.state)
             ):
                 log("  OAuth 页面检测到更新的授权链接，跟随页面授权链接...")
-                page.goto(page_oauth_url, wait_until="domcontentloaded", timeout=30000)
+                _goto_with_retry(page, page_oauth_url, wait_until="domcontentloaded", timeout=30000, log=log)
                 continue
 
             if state["page_type"] == "login_email":
@@ -2524,7 +2611,7 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 # 用户已登录，重新访问 auth URL 应该能直接跳到 callback
                 log("  检测到 add_phone，尝试跳过...")
                 try:
-                    page.goto(oauth_start.auth_url, wait_until="domcontentloaded", timeout=15000)
+                    _goto_with_retry(page, oauth_start.auth_url, wait_until="domcontentloaded", timeout=15000, log=log)
                     time.sleep(2)
                     current_url = str(page.url or "")
 
@@ -2601,7 +2688,7 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
             target_url = _normalize_url(state.get("continue_url") or "", OPENAI_AUTH)
             if target_url and target_url != current_url:
                 try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    _goto_with_retry(page, target_url, wait_until="domcontentloaded", timeout=30000, log=log)
                 except Exception as exc:
                     callback_url = _extract_callback_url_from_exception(exc)
                     if callback_url:
@@ -2774,7 +2861,7 @@ def _handle_add_phone_challenge(
             log(f"换号重试第 {phone_attempt + 1}/{max_phone_attempts} 次...")
             # 回到 add-phone 页面
             try:
-                page.goto(f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=15000)
+                _goto_with_retry(page, f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=15000, log=log)
                 time.sleep(1)
             except Exception:
                 pass
@@ -2875,7 +2962,7 @@ def _do_add_phone_attempt(
     # 确保在 add-phone 页面
     current_url = str(page.url or "")
     if "add-phone" not in current_url:
-        page.goto(f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=30000)
+        _goto_with_retry(page, f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=30000, log=log)
     time.sleep(1)
 
     submit_result = _submit_add_phone_dom(
@@ -2957,7 +3044,7 @@ def _do_add_phone_attempt(
                 state = _derive_registration_state_from_page(page)
             next_url = _normalize_url(resume_url, OPENAI_AUTH) if resume_url else ""
             if next_url:
-                page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                _goto_with_retry(page, next_url, wait_until="domcontentloaded", timeout=30000, log=log)
                 return _extract_flow_state(None, page.url)
             return state
 
@@ -3065,7 +3152,7 @@ def _browser_authorize(page, auth_url: str, log) -> str:
     if not auth_url:
         return ""
     try:
-        page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+        _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
         final_url = page.url
         log(f"Authorize -> {final_url[:120]}")
         return final_url
@@ -3430,7 +3517,7 @@ def _complete_oauth_in_browser(page, oauth_start, proxy, log) -> dict | None:
             if round_idx < MAX_ROUNDS - 1:
                 log(f"  consent 刷新页面准备第{round_idx + 2}轮...")
                 try:
-                    page.reload(wait_until="domcontentloaded", timeout=15000)
+                    _reload_with_retry(page, wait_until="domcontentloaded", timeout=15000, log=log)
                 except Exception:
                     pass
                 time.sleep(2)
@@ -4440,7 +4527,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             )
             if "about-you" not in str(page.url):
                 log(f"跳转到 about_you 页面: {target_url[:120]}")
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                _goto_with_retry(page, target_url, wait_until="domcontentloaded", timeout=30000, log=log)
             about_resp = _submit_about_you_via_page(page, log)
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
@@ -4480,7 +4567,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             target_url = _normalize_url(str(state.get("continue_url") or state.get("current_url") or ""), OPENAI_AUTH)
             if not target_url:
                 raise RuntimeError("缺少可跟随的 continue_url")
-            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            _goto_with_retry(page, target_url, wait_until="domcontentloaded", timeout=30000, log=log)
             state = _extract_flow_state(None, page.url)
             continue
 
@@ -4499,12 +4586,19 @@ class ChatGPTBrowserRegister:
         phone_callback: Optional[Callable[[], str]] = None,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
+        post_register_in_browser: Optional[Callable[[Any, dict], dict]] = None,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
         self.phone_callback = phone_callback
         self.log = log_fn
+        # post_register_in_browser(page, session_info) -> dict|None：
+        # 注册拿到 session 后、**浏览器还开着**时回调。短链复用流程用它在
+        # 同一个浏览器/同一 page 里打开短链并抓 midtrans_url。返回的 dict 会
+        # 合并进 run() 的结果（如 {"midtrans_url": "..."}）。回调异常不影响
+        # 注册结果本身（只记日志、不抛）。
+        self.post_register_in_browser = post_register_in_browser
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
         self.backend_config = backend_config or BrowserBackendConfig.camoufox(
@@ -4556,7 +4650,7 @@ class ChatGPTBrowserRegister:
             # 获取 session token 和 cookies
             cookies_dict = _get_cookies(page)
             session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
-            return {
+            result = {
                 "email": email,
                 "password": password,
                 "account_id": session_info.get("account_id", ""),
@@ -4571,6 +4665,18 @@ class ChatGPTBrowserRegister:
                 "session": session_info.get("session", {}),
                 "registration_state": final_state,
             }
+
+            # 短链复用流程：注册拿到 session 后、**浏览器还开着**时，在同一个
+            # page 里继续打开短链 + 抓 midtrans_url。结果合并进返回值。
+            if callable(self.post_register_in_browser):
+                try:
+                    self.log("注册完成，浏览器保持打开，继续在同一浏览器里走短链付款流程…")
+                    extra = self.post_register_in_browser(page, dict(result))
+                    if isinstance(extra, dict):
+                        result.update(extra)
+                except Exception as exc:
+                    self.log(f"浏览器内短链后续流程异常（不影响注册结果）: {exc}")
+            return result
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""

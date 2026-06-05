@@ -55,6 +55,8 @@ const DEFAULT_PAYMENT = {
   // Stripe 协议长链：用 accessToken 直接生成 pay.openai.com cashier_url（纯协议）。
   // 默认 "false" 沿用原行为。
   use_stripe_init: "false",
+  // 短链：checkout_ui_mode=custom → chatgpt.com/checkout/openai_llc 短链。
+  use_short_link: "false",
   // SMS 号码池（多行 `+phone----relay_url`），PayPal OTP 用。空串=不启用。
   sms_pool: "",
 };
@@ -357,6 +359,18 @@ function GeneratePlusModal({
     selection.identityProvider,
   ]);
 
+  // 短链物理复用：注册和打开短链必须同一浏览器，所以付款 checkout_mode 强制
+  // 跟随注册的 executorType（两个浏览器选项合并成一个）。短链 off 时不干预。
+  const isShortLink = String(payment.use_short_link) === "true";
+  useEffect(() => {
+    if (!isShortLink) return;
+    const reg = String(selection.executorType || "");
+    // 只在注册用的是浏览器模式时同步（protocol 注册没浏览器可复用）。
+    if (reg && reg !== "protocol" && String(payment.checkout_mode) !== reg) {
+      setPayment((cur) => ({ ...cur, checkout_mode: reg }));
+    }
+  }, [isShortLink, selection.executorType, payment.checkout_mode]);
+
   const updatePayment = (key: string, value: string | number) => {
     setPayment((current) => ({ ...current, [key]: value }));
   };
@@ -413,6 +427,7 @@ function GeneratePlusModal({
           record_har: payment.record_har,
           use_captcha_service: payment.use_captcha_service,
           use_stripe_init: payment.use_stripe_init,
+          use_short_link: payment.use_short_link,
           proxy_region: payment.country,
           address_region: payment.address_region || "US",
           sms_pool: payment.sms_pool,
@@ -489,6 +504,7 @@ function GeneratePlusModal({
           // 强制传 None，captcha 路径退化为"代码鼠标点击 + 10s 等转跳"。
           use_captcha_service: payment.use_captcha_service,
           use_stripe_init: payment.use_stripe_init,
+          use_short_link: payment.use_short_link,
           proxy_region: payment.country,
           // 账单地址来源：US 走 meiguodizhi 主接口，JP 走 /jp-address。
           // 让 IP 在日本时也能拿到日文地址 + 日本邮编避免 PayPal 风控。
@@ -692,6 +708,15 @@ function GeneratePlusModal({
                             </div>
                           ) : null;
                         })()}
+                        {isShortLink &&
+                          (selection.executorType === "protocol" ||
+                            !selection.executorType) && (
+                            <div className="mt-1 text-xs leading-5 text-amber-500">
+                              ⚠ 短链模式必须用浏览器注册（注册和打开短链要复用同一个浏览器）。
+                              当前选的是协议注册，会被自动改成 Camoufox 前台。建议直接选一个浏览器注册模式
+                              （Camoufox / BitBrowser）。
+                            </div>
+                          )}
                       </div>
                     </section>
                   </>
@@ -701,41 +726,51 @@ function GeneratePlusModal({
                   <div className="text-sm font-semibold text-[var(--text-primary)]">
                     {t("ctfGptPlus.paymentMode")}
                   </div>
-                  <div className="mt-3">
-                    <select
-                      value={String(payment.checkout_mode)}
-                      onChange={(event) =>
-                        updatePayment("checkout_mode", event.target.value)
-                      }
-                      className="control-surface control-surface-compact w-full"
-                    >
-                      <option value="protocol">
-                        {t("choice.executor.protocol")}
-                      </option>
-                      <option value="camoufox_headless">
-                        {t("ctfGptPlus.camoufoxBackground")}
-                      </option>
-                      <option value="camoufox_headed">
-                        {t("ctfGptPlus.camoufoxForeground")}
-                      </option>
-                      <option value="bitbrowser_headed">
-                        {t("ctfGptPlus.bitbrowserHeaded")}
-                      </option>
-                      <option value="bitbrowser_hidden">
-                        {t("ctfGptPlus.bitbrowserHidden")}
-                      </option>
-                      <option value="bitbrowser_headless">
-                        {t("ctfGptPlus.bitbrowserHeadless")}
-                      </option>
-                    </select>
-                    {String(payment.checkout_mode).startsWith(
-                      "bitbrowser_",
-                    ) && (
-                      <div className="mt-1 text-xs leading-5 text-[var(--text-muted)]">
-                        {t("ctfGptPlus.bitbrowserPoolHint")}
-                      </div>
-                    )}
-                  </div>
+                  {isShortLink ? (
+                    <div className="mt-3 rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-xs leading-5 text-[var(--text-muted)]">
+                      短链模式：付款与注册<strong>共用同一个浏览器</strong>（物理复用），
+                      浏览器模式跟随上方「注册模式」的选择
+                      （当前：<strong>{String(payment.checkout_mode) || "—"}</strong>）。
+                      短链是 ChatGPT 托管页、URL 无 token，必须用注册时那个已登录的浏览器打开，
+                      所以这里不单独选浏览器。注册用 protocol 时短链会自动改用 Camoufox 前台。
+                    </div>
+                  ) : (
+                    <div className="mt-3">
+                      <select
+                        value={String(payment.checkout_mode)}
+                        onChange={(event) =>
+                          updatePayment("checkout_mode", event.target.value)
+                        }
+                        className="control-surface control-surface-compact w-full"
+                      >
+                        <option value="protocol">
+                          {t("choice.executor.protocol")}
+                        </option>
+                        <option value="camoufox_headless">
+                          {t("ctfGptPlus.camoufoxBackground")}
+                        </option>
+                        <option value="camoufox_headed">
+                          {t("ctfGptPlus.camoufoxForeground")}
+                        </option>
+                        <option value="bitbrowser_headed">
+                          {t("ctfGptPlus.bitbrowserHeaded")}
+                        </option>
+                        <option value="bitbrowser_hidden">
+                          {t("ctfGptPlus.bitbrowserHidden")}
+                        </option>
+                        <option value="bitbrowser_headless">
+                          {t("ctfGptPlus.bitbrowserHeadless")}
+                        </option>
+                      </select>
+                      {String(payment.checkout_mode).startsWith(
+                        "bitbrowser_",
+                      ) && (
+                        <div className="mt-1 text-xs leading-5 text-[var(--text-muted)]">
+                          {t("ctfGptPlus.bitbrowserPoolHint")}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </section>
 
                 <section className="grid gap-3 md:grid-cols-4">
@@ -879,6 +914,22 @@ function GeneratePlusModal({
                       }
                       className="control-surface control-surface-compact"
                       title="用 accessToken 直接调 Stripe payment_pages/init 生成 pay.openai.com 长链（纯协议，不靠默认接口 url）"
+                    >
+                      <option value="false">{t("common.no")}</option>
+                      <option value="true">{t("common.yes")}</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-[var(--text-muted)]">
+                      短链
+                    </label>
+                    <select
+                      value={String(payment.use_short_link)}
+                      onChange={(event) =>
+                        updatePayment("use_short_link", event.target.value)
+                      }
+                      className="control-surface control-surface-compact"
+                      title="checkout_ui_mode=custom + all_plans_pricing_modal 入口、无优惠券，返回 chatgpt.com/checkout/openai_llc/<id> 短链（与 Stripe 长链二选一，短链优先）"
                     >
                       <option value="false">{t("common.no")}</option>
                       <option value="true">{t("common.yes")}</option>

@@ -104,6 +104,9 @@ class GoPayPayChatGptTaskRequest(BaseModel):
     # pay.openai.com 长链，纯协议、不开浏览器拿 cashier 链）。默认 False 沿用
     # 原有 generate_plus_link 行为。
     use_stripe_init: bool = False
+    # 短链：checkout_ui_mode=custom + all_plans_pricing_modal 入口，无 promo，
+    # 返回 chatgpt.com/checkout/openai_llc/<cs_id> 短链。
+    use_short_link: bool = False
 
 
 @router.post("/register")
